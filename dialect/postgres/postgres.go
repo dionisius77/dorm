@@ -5,8 +5,8 @@ import (
 	"strconv"
 	"strings"
 
-	"dorm/dialect"
-	"dorm/schema"
+	"github.com/dionisius77/dorm/dialect"
+	"github.com/dionisius77/dorm/schema"
 )
 
 type Dialect struct{}

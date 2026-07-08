@@ -6,8 +6,8 @@ import (
 	"path/filepath"
 	"testing"
 
-	"dorm/dialect/postgres"
-	"dorm/schema"
+	"github.com/dionisius77/dorm/dialect/postgres"
+	"github.com/dionisius77/dorm/schema"
 )
 
 func TestGenerateWritesDeterministicMigration(t *testing.T) {

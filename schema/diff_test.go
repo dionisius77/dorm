@@ -3,7 +3,7 @@ package schema_test
 import (
 	"testing"
 
-	"dorm/schema"
+	"github.com/dionisius77/dorm/schema"
 )
 
 func TestCompareDetectsAddedColumn(t *testing.T) {

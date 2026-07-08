@@ -4,7 +4,7 @@ import (
 	"context"
 	"fmt"
 
-	"dorm/schema"
+	"github.com/dionisius77/dorm/schema"
 )
 
 type Operation string

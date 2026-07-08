@@ -10,9 +10,9 @@ import (
 	"sync"
 	"time"
 
-	"dorm/access"
-	"dorm/dialect"
-	"dorm/schema"
+	"github.com/dionisius77/dorm/access"
+	"github.com/dionisius77/dorm/dialect"
+	"github.com/dionisius77/dorm/schema"
 )
 
 var ErrNotFound = errors.New("orm: not found")

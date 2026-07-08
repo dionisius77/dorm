@@ -1,6 +1,6 @@
 package dialect
 
-import "dorm/schema"
+import "github.com/dionisius77/dorm/schema"
 
 type Capabilities struct {
 	UUID               bool

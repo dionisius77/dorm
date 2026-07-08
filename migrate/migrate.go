@@ -12,8 +12,8 @@ import (
 	"strings"
 	"time"
 
-	"dorm/dialect"
-	"dorm/schema"
+	"github.com/dionisius77/dorm/dialect"
+	"github.com/dionisius77/dorm/schema"
 )
 
 type Config struct {

@@ -6,7 +6,7 @@ import (
 	"path/filepath"
 	"testing"
 
-	"dorm/schema"
+	"github.com/dionisius77/dorm/schema"
 )
 
 func TestBuilderParsesModelMetadata(t *testing.T) {

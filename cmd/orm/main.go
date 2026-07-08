@@ -9,9 +9,9 @@ import (
 	"os"
 	"path/filepath"
 
-	"dorm/dialect/postgres"
-	"dorm/migrate"
-	"dorm/schema"
+	"github.com/dionisius77/dorm/dialect/postgres"
+	"github.com/dionisius77/dorm/migrate"
+	"github.com/dionisius77/dorm/schema"
 )
 
 func main() {

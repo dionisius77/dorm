@@ -4,7 +4,7 @@ import (
 	"context"
 	"testing"
 
-	"dorm/schema"
+	"github.com/dionisius77/dorm/schema"
 )
 
 func TestEngineInjectsCompanyScope(t *testing.T) {

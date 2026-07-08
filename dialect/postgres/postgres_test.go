@@ -3,7 +3,7 @@ package postgres
 import (
 	"testing"
 
-	"dorm/schema"
+	"github.com/dionisius77/dorm/schema"
 )
 
 func TestRenderSelect(t *testing.T) {

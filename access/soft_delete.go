@@ -1,6 +1,6 @@
 package access
 
-import "dorm/schema"
+import "github.com/dionisius77/dorm/schema"
 
 func SoftDeleteColumn(table *schema.Table) *schema.Column {
 	if table == nil {
