@@ -84,6 +84,9 @@ func (s *Session) WithDeleted() *Session {
 }
 
 func (s *Session) Find(dest any, opts ...QueryOption) error {
+	if err := invokeBeforeFindHook(s.ctx, dest); err != nil {
+		return err
+	}
 	state, err := s.buildState(dest, opts...)
 	if err != nil {
 		return err
@@ -97,7 +100,10 @@ func (s *Session) Find(dest any, opts ...QueryOption) error {
 		return err
 	}
 	defer rows.Close()
-	return scanIntoSlice(rows, dest, state.table)
+	if err := scanIntoSlice(rows, dest, state.table); err != nil {
+		return err
+	}
+	return invokeAfterFindHooks(s.ctx, reflect.ValueOf(dest).Elem())
 }
 
 func (s *Session) FindOne(dest any, opts ...QueryOption) error {
@@ -113,6 +119,9 @@ func (s *Session) FindOne(dest any, opts ...QueryOption) error {
 }
 
 func (s *Session) Create(model any) error {
+	if err := invokeBeforeCreateHook(s.ctx, model); err != nil {
+		return err
+	}
 	meta, rv, err := s.resolveModel(model)
 	if err != nil {
 		return err
@@ -134,10 +143,16 @@ func (s *Session) Create(model any) error {
 	if err != nil {
 		return err
 	}
-	return s.db.execReturning(s.ctx, sqlText, args, model, table)
+	if err := s.db.execReturning(s.ctx, sqlText, args, model, table); err != nil {
+		return err
+	}
+	return invokeAfterCreateHook(s.ctx, model)
 }
 
 func (s *Session) Update(model any) error {
+	if err := invokeBeforeUpdateHook(s.ctx, model); err != nil {
+		return err
+	}
 	meta, rv, err := s.resolveModel(model)
 	if err != nil {
 		return err
@@ -164,10 +179,16 @@ func (s *Session) Update(model any) error {
 	if err != nil {
 		return err
 	}
-	return s.db.execReturning(s.ctx, sqlText, append(args, whereArgs...), model, table)
+	if err := s.db.execReturning(s.ctx, sqlText, append(args, whereArgs...), model, table); err != nil {
+		return err
+	}
+	return invokeAfterUpdateHook(s.ctx, model)
 }
 
 func (s *Session) Delete(model any) error {
+	if err := invokeBeforeDeleteHook(s.ctx, model); err != nil {
+		return err
+	}
 	meta, rv, err := s.resolveModel(model)
 	if err != nil {
 		return err
@@ -189,10 +210,16 @@ func (s *Session) Delete(model any) error {
 		return err
 	}
 	_, err = s.db.execContext(s.ctx, sqlText, whereArgs...)
-	return err
+	if err != nil {
+		return err
+	}
+	return invokeAfterDeleteHook(s.ctx, model)
 }
 
 func (s *Session) SoftDelete(model any) error {
+	if err := invokeBeforeDeleteHook(s.ctx, model); err != nil {
+		return err
+	}
 	meta, rv, err := s.resolveModel(model)
 	if err != nil {
 		return err
@@ -202,7 +229,10 @@ func (s *Session) SoftDelete(model any) error {
 	if soft == nil {
 		return fmt.Errorf("orm: table %s has no soft delete column", table.Name)
 	}
-	return s.softDelete(model, table, rv, soft)
+	if err := s.softDelete(model, table, rv, soft); err != nil {
+		return err
+	}
+	return invokeAfterDeleteHook(s.ctx, model)
 }
 
 func (s *Session) Upsert(model any) error {
