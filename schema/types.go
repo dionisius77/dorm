@@ -4,8 +4,11 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/dionisius77/dorm/errkind"
 )
 
+// Schema is the in-memory representation of discovered database structure.
 type Schema struct {
 	Name    string
 	Version int
@@ -14,6 +17,7 @@ type Schema struct {
 	Views   []*View
 }
 
+// Table describes a database table or view backing structure.
 type Table struct {
 	Name        string
 	GoTypeName  string
@@ -25,6 +29,7 @@ type Table struct {
 	Metadata    map[string]string
 }
 
+// Column describes a database column and its inferred metadata.
 type Column struct {
 	Name          string
 	GoName        string
@@ -47,6 +52,7 @@ type Column struct {
 	Tags          map[string]string
 }
 
+// Index describes a database index definition.
 type Index struct {
 	Name       string
 	Columns    []string
@@ -57,6 +63,7 @@ type Index struct {
 	Metadata   map[string]string
 }
 
+// ConstraintKind identifies a constraint category.
 type ConstraintKind string
 
 const (
@@ -66,6 +73,7 @@ const (
 	ConstraintCheck      ConstraintKind = "check"
 )
 
+// Constraint describes a table constraint.
 type Constraint struct {
 	Name              string
 	Kind              ConstraintKind
@@ -78,6 +86,7 @@ type Constraint struct {
 	Metadata          map[string]string
 }
 
+// TypeKind identifies the broad kind of a column type.
 type TypeKind string
 
 const (
@@ -95,6 +104,7 @@ const (
 	TypeCustom  TypeKind = "custom"
 )
 
+// Type describes a database type with optional metadata.
 type Type struct {
 	Name       string
 	Kind       TypeKind
@@ -107,6 +117,7 @@ type Type struct {
 	Metadata   map[string]string
 }
 
+// ScopeKind identifies an access-control scope attached to a column.
 type ScopeKind string
 
 const (
@@ -119,6 +130,7 @@ const (
 	ScopeUser         ScopeKind = "user"
 )
 
+// View describes a database view definition.
 type View struct {
 	Name         string
 	SQL          string
@@ -272,30 +284,30 @@ func (s *Schema) Sort() {
 
 func (s *Schema) Validate() error {
 	if s == nil {
-		return fmt.Errorf("schema: nil schema")
+		return errkind.New(errkind.KindInvalidSchema, "schema: nil schema")
 	}
 	names := make(map[string]struct{}, len(s.Tables))
 	for _, t := range s.Tables {
 		if t == nil {
-			return fmt.Errorf("schema: nil table")
+			return errkind.New(errkind.KindInvalidSchema, "schema: nil table")
 		}
 		if t.Name == "" {
-			return fmt.Errorf("schema: table missing name")
+			return errkind.New(errkind.KindInvalidSchema, "schema: table missing name")
 		}
 		if _, ok := names[t.Name]; ok {
-			return fmt.Errorf("schema: duplicate table %q", t.Name)
+			return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("schema: duplicate table %q", t.Name))
 		}
 		names[t.Name] = struct{}{}
 		columnNames := make(map[string]struct{}, len(t.Columns))
 		for _, c := range t.Columns {
 			if c == nil {
-				return fmt.Errorf("schema: table %s has nil column", t.Name)
+				return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("schema: table %s has nil column", t.Name))
 			}
 			if c.Name == "" {
-				return fmt.Errorf("schema: table %s has column with empty name", t.Name)
+				return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("schema: table %s has column with empty name", t.Name))
 			}
 			if _, ok := columnNames[c.Name]; ok {
-				return fmt.Errorf("schema: table %s has duplicate column %q", t.Name, c.Name)
+				return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("schema: table %s has duplicate column %q", t.Name, c.Name))
 			}
 			columnNames[c.Name] = struct{}{}
 		}

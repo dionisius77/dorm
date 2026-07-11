@@ -12,74 +12,102 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+
+	"github.com/dionisius77/dorm/errkind"
 )
 
 type Builder struct {
 	Root string
 }
 
+// NewBuilder returns a schema builder rooted at a source tree.
 func NewBuilder(root string) *Builder {
 	return &Builder{Root: root}
 }
 
+// Build parses source files and returns the discovered schema.
 func (b *Builder) Build(ctx context.Context) (*Schema, error) {
-	_ = ctx
-	if b == nil {
-		return nil, fmt.Errorf("schema: nil builder")
-	}
-	if b.Root == "" {
-		return nil, fmt.Errorf("schema: empty root")
-	}
+	var result *Schema
+	err := traceOperation(ctx, "db.schema.build", func(ctx context.Context) error {
+		if b == nil {
+			return errkind.New(errkind.KindConfiguration, "schema: nil builder")
+		}
+		if b.Root == "" {
+			return errkind.New(errkind.KindConfiguration, "schema: empty root")
+		}
+		fingerprint, err := sourceFingerprint(b.Root)
+		if err != nil {
+			return err
+		}
+		if cached, ok := loadCachedSchema(b.Root, fingerprint); ok {
+			result = cached
+			return nil
+		}
 
-	fset := token.NewFileSet()
-	pkgs, err := parser.ParseDir(fset, b.Root, func(info os.FileInfo) bool { return !strings.HasSuffix(info.Name(), "_test.go") }, parser.ParseComments)
-	if err != nil {
-		return nil, err
-	}
+		fset := token.NewFileSet()
+		pkgs, err := parser.ParseDir(fset, b.Root, func(info os.FileInfo) bool { return !strings.HasSuffix(info.Name(), "_test.go") }, parser.ParseComments)
+		if err != nil {
+			return err
+		}
 
-	out := &Schema{Name: filepath.Base(b.Root), Version: 1}
-	for pkgName, pkg := range pkgs {
-		_ = pkgName
-		for fileName, file := range pkg.Files {
-			_ = fileName
-			packageName := file.Name.Name
-			for _, decl := range file.Decls {
-				gen, ok := decl.(*ast.GenDecl)
-				if !ok || gen.Tok != token.TYPE {
-					continue
-				}
-				for _, spec := range gen.Specs {
-					typeSpec, ok := spec.(*ast.TypeSpec)
-					if !ok {
+		out := &Schema{Name: filepath.Base(b.Root), Version: 1}
+		for _, pkg := range pkgs {
+			structTypes := collectPackageStructTypes(pkg)
+			embeddedTypes := collectPackageEmbeddedTypeNames(pkg)
+			for _, file := range pkg.Files {
+				packageName := file.Name.Name
+				for _, decl := range file.Decls {
+					gen, ok := decl.(*ast.GenDecl)
+					if !ok || gen.Tok != token.TYPE {
 						continue
 					}
-					st, ok := typeSpec.Type.(*ast.StructType)
-					if !ok || !ast.IsExported(typeSpec.Name.Name) {
-						continue
-					}
-					model := buildTableFromType(typeSpec, st, packageName, file)
-					if model != nil {
-						out.Tables = append(out.Tables, model)
+					for _, spec := range gen.Specs {
+						typeSpec, ok := spec.(*ast.TypeSpec)
+						if !ok {
+							continue
+						}
+						st, ok := typeSpec.Type.(*ast.StructType)
+						if !ok || !ast.IsExported(typeSpec.Name.Name) {
+							continue
+						}
+						doc := commentText(gen.Doc, typeSpec.Doc, file.Doc)
+						if viewSQL := directiveValue(doc, "view"); viewSQL != "" {
+							out.Views = append(out.Views, buildViewFromType(typeSpec, packageName, doc, viewSQL))
+							continue
+						}
+						if _, ok := embeddedTypes[typeSpec.Name.Name]; ok && directiveValue(doc, "table") == "" {
+							continue
+						}
+						model := buildTableFromType(typeSpec, st, packageName, doc, structTypes)
+						if model != nil {
+							out.Tables = append(out.Tables, model)
+						}
 					}
 				}
 			}
 		}
-	}
-	out.Sort()
-	if err := out.Validate(); err != nil {
+		out.Sort()
+		if err := out.Validate(); err != nil {
+			return err
+		}
+		storeCachedSchema(b.Root, fingerprint, out)
+		result = out.Clone()
+		return nil
+	})
+	if err != nil {
 		return nil, err
 	}
-	return out, nil
+	return result, nil
 }
 
-func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName string, file *ast.File) *Table {
+func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName, doc string, structTypes map[string]*ast.StructType) *Table {
 	table := &Table{
 		Name:        Pluralize(ToSnakeCase(typeSpec.Name.Name)),
 		GoTypeName:  typeSpec.Name.Name,
 		PackageName: packageName,
 		Metadata:    map[string]string{},
 	}
-	if doc := commentText(typeSpec.Doc, file.Doc); doc != "" {
+	if doc != "" {
 		if name := directiveValue(doc, "table"); name != "" {
 			table.Name = name
 		}
@@ -87,17 +115,7 @@ func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName 
 			table.Metadata["name"] = title
 		}
 	}
-	for _, field := range st.Fields.List {
-		if len(field.Names) == 0 {
-			continue
-		}
-		for _, name := range field.Names {
-			col := buildColumn(name.Name, field, table)
-			if col != nil {
-				table.Columns = append(table.Columns, col)
-			}
-		}
-	}
+	table.Columns = append(table.Columns, buildColumnsFromStruct(typeSpec.Name.Name, st, structTypes, table, nil, map[string]bool{})...)
 	if !hasPrimaryKey(table) {
 		if c := columnByName(table.Columns, "id"); c != nil {
 			c.PrimaryKey = true
@@ -114,7 +132,67 @@ func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName 
 	return table
 }
 
-func buildColumn(goName string, field *ast.Field, table *Table) *Column {
+func buildViewFromType(typeSpec *ast.TypeSpec, packageName, doc, sqlText string) *View {
+	view := &View{
+		Name: ToSnakeCase(typeSpec.Name.Name),
+		SQL:  sqlText,
+		Metadata: map[string]string{
+			"type":    typeSpec.Name.Name,
+			"package": packageName,
+		},
+	}
+	if doc != "" {
+		if name := directiveValue(doc, "name"); name != "" {
+			view.Name = name
+			view.Metadata["name"] = name
+		} else if tableName := directiveValue(doc, "table"); tableName != "" {
+			view.Name = tableName
+			view.Metadata["name"] = tableName
+		}
+		if materialized := directiveValue(doc, "materialized"); strings.EqualFold(materialized, "true") {
+			view.Materialized = true
+		}
+	}
+	return view
+}
+
+func buildColumnsFromStruct(typeName string, st *ast.StructType, structTypes map[string]*ast.StructType, table *Table, traitStack []string, seen map[string]bool) []*Column {
+	if st == nil {
+		return nil
+	}
+	if seen == nil {
+		seen = map[string]bool{}
+	}
+	if seen[typeName] {
+		return nil
+	}
+	seen[typeName] = true
+	defer delete(seen, typeName)
+
+	var cols []*Column
+	for _, field := range st.Fields.List {
+		if len(field.Names) == 0 {
+			embedded := embeddedTypeName(field.Type)
+			if embedded == "" {
+				continue
+			}
+			if nested, ok := structTypes[embedded]; ok {
+				cols = append(cols, buildColumnsFromStruct(embedded, nested, structTypes, table, append(traitStack, embedded), seen)...)
+			}
+			continue
+		}
+		for _, name := range field.Names {
+			col := buildColumn(name.Name, field, table, traitStack)
+			if col == nil {
+				continue
+			}
+			cols = append(cols, col)
+		}
+	}
+	return cols
+}
+
+func buildColumn(goName string, field *ast.Field, table *Table, traitStack []string) *Column {
 	tag := ""
 	if field.Tag != nil {
 		if unquoted, err := strconv.Unquote(field.Tag.Value); err == nil {
@@ -122,8 +200,7 @@ func buildColumn(goName string, field *ast.Field, table *Table) *Column {
 		}
 	}
 	tagMap := parseStructTag(tag)
-	ormTag := tagMap["orm"]
-	meta := parseORMTag(ormTag)
+	meta := parseORMTag(tagMap["orm"])
 
 	col := &Column{
 		Name:   ToSnakeCase(goName),
@@ -152,26 +229,26 @@ func buildColumn(goName string, field *ast.Field, table *Table) *Column {
 		col.SoftDelete = true
 		col.Nullable = true
 	}
-	if meta["created_at"].IsSet {
+	if meta["created_at"].IsSet || hasTrait(traitStack, "Audit") && strings.EqualFold(goName, "CreatedAt") {
 		col.CreatedAt = true
 	}
-	if meta["updated_at"].IsSet {
+	if meta["updated_at"].IsSet || hasTrait(traitStack, "Audit") && strings.EqualFold(goName, "UpdatedAt") {
 		col.UpdatedAt = true
 	}
-	if meta["deleted_at"].IsSet {
+	if meta["deleted_at"].IsSet || hasTrait(traitStack, "Audit") && strings.EqualFold(goName, "DeletedAt") {
 		col.DeletedAt = true
 		col.Nullable = true
 	}
-	if meta["created_by"].IsSet {
+	if meta["created_by"].IsSet || hasTrait(traitStack, "Audit") && strings.EqualFold(goName, "CreatedBy") {
 		col.CreatedBy = true
 	}
-	if meta["updated_by"].IsSet {
+	if meta["updated_by"].IsSet || hasTrait(traitStack, "Audit") && strings.EqualFold(goName, "UpdatedBy") {
 		col.UpdatedBy = true
 	}
-	if meta["deleted_by"].IsSet {
+	if meta["deleted_by"].IsSet || hasTrait(traitStack, "Audit") && strings.EqualFold(goName, "DeletedBy") {
 		col.DeletedBy = true
 	}
-	if meta["company"].IsSet {
+	if meta["company"].IsSet || hasTrait(traitStack, "Company") && strings.EqualFold(goName, "CompanyID") {
 		col.Scope = ScopeCompany
 	}
 	if meta["tenant"].IsSet {
@@ -219,40 +296,106 @@ func buildColumn(goName string, field *ast.Field, table *Table) *Column {
 	if meta["enum"].IsSet {
 		col.Type.Kind = TypeEnum
 		col.Type.Name = meta["enum"].Value
-		values := meta["values"].Value
-		if values != "" {
+		if values := meta["values"].Value; values != "" {
 			col.Type.EnumValues = strings.Split(values, "|")
 		}
 	}
-	if meta["index"].IsSet {
+	if meta["index"].IsSet && table != nil {
 		table.Indexes = append(table.Indexes, &Index{
 			Name:    "idx_" + table.Name + "_" + col.Name,
 			Columns: []string{col.Name},
 		})
 	}
-	if meta["where"].IsSet {
+	if meta["where"].IsSet && table != nil {
 		table.Indexes = append(table.Indexes, &Index{
 			Name:    "idx_" + table.Name + "_" + col.Name,
 			Columns: []string{col.Name},
 			Where:   meta["where"].Value,
 		})
 	}
-	if tagMap["json"] == "true" {
+	if meta["json"].IsSet {
 		col.Type.Kind = TypeJSON
 		col.Type.Name = "jsonb"
 	}
-	if tagMap["array"] == "true" {
+	if meta["array"].IsSet {
 		col.Type.Kind = TypeArray
-	}
-	if tagMap["pk"] == "true" && !col.PrimaryKey {
-		col.PrimaryKey = true
-		col.Unique = true
-	}
-	if tagMap["unique"] == "true" && !col.Unique {
-		col.Unique = true
 	}
 	col.Tags = tagMap
 	return col
+}
+
+func collectPackageStructTypes(pkg *ast.Package) map[string]*ast.StructType {
+	out := map[string]*ast.StructType{}
+	if pkg == nil {
+		return out
+	}
+	for _, file := range pkg.Files {
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				st, ok := typeSpec.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				out[typeSpec.Name.Name] = st
+			}
+		}
+	}
+	return out
+}
+
+func collectPackageEmbeddedTypeNames(pkg *ast.Package) map[string]struct{} {
+	out := map[string]struct{}{}
+	if pkg == nil {
+		return out
+	}
+	for _, file := range pkg.Files {
+		for _, decl := range file.Decls {
+			gen, ok := decl.(*ast.GenDecl)
+			if !ok || gen.Tok != token.TYPE {
+				continue
+			}
+			for _, spec := range gen.Specs {
+				typeSpec, ok := spec.(*ast.TypeSpec)
+				if !ok {
+					continue
+				}
+				st, ok := typeSpec.Type.(*ast.StructType)
+				if !ok {
+					continue
+				}
+				for _, field := range st.Fields.List {
+					if len(field.Names) != 0 {
+						continue
+					}
+					if name := embeddedTypeName(field.Type); name != "" {
+						out[name] = struct{}{}
+					}
+				}
+			}
+		}
+	}
+	return out
+}
+
+func embeddedTypeName(expr ast.Expr) string {
+	switch t := expr.(type) {
+	case *ast.Ident:
+		return t.Name
+	case *ast.StarExpr:
+		return embeddedTypeName(t.X)
+	case *ast.SelectorExpr:
+		return t.Sel.Name
+	default:
+		return ""
+	}
 }
 
 type tagEntry struct {
@@ -364,6 +507,9 @@ func typeKindFromName(name string) TypeKind {
 func inferType(expr ast.Expr, meta map[string]tagEntry) Type {
 	switch t := expr.(type) {
 	case *ast.Ident:
+		if typ, ok := ResolveCustomTypeName(t.Name); ok {
+			return typ
+		}
 		switch t.Name {
 		case "string":
 			return Type{Name: "text", Kind: TypeString}
@@ -389,6 +535,12 @@ func inferType(expr ast.Expr, meta map[string]tagEntry) Type {
 		pkg := exprString(t.X)
 		name := t.Sel.Name
 		full := pkg + "." + name
+		if typ, ok := ResolveCustomTypeName(full); ok {
+			return typ
+		}
+		if typ, ok := ResolveCustomTypeName(name); ok {
+			return typ
+		}
 		switch full {
 		case "time.Time":
 			return Type{Name: "timestamptz", Kind: TypeTime}
@@ -409,6 +561,20 @@ func inferType(expr ast.Expr, meta map[string]tagEntry) Type {
 	default:
 		return Type{Name: "text", Kind: TypeUnknown}
 	}
+}
+
+// ResolveCustomTypeName looks up a registered custom schema type by name.
+func ResolveCustomTypeName(name string) (Type, bool) {
+	name = normalizeCustomTypeName(name)
+	if name == "" {
+		return Type{}, false
+	}
+	customTypeMu.RLock()
+	defer customTypeMu.RUnlock()
+	if typ, ok := customTypeByName[name]; ok {
+		return typ, true
+	}
+	return Type{}, false
 }
 
 func exprString(expr ast.Expr) string {

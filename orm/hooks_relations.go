@@ -7,6 +7,8 @@ import (
 	"reflect"
 	"strings"
 
+	"github.com/dionisius77/dorm/dialect"
+	"github.com/dionisius77/dorm/errkind"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -44,14 +46,14 @@ type AfterFindHook interface {
 
 func (s *Session) Load(dest any, relation string) error {
 	if s == nil {
-		return fmt.Errorf("orm: nil session")
+		return errkind.New(errkind.KindConfiguration, "orm: nil session")
 	}
 	if relation == "" {
-		return fmt.Errorf("orm: empty relation name")
+		return errkind.New(errkind.KindConfiguration, "orm: empty relation name")
 	}
 	rv := reflect.ValueOf(dest)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
-		return fmt.Errorf("orm: load destination must be a non-nil pointer")
+		return errkind.New(errkind.KindConfiguration, "orm: load destination must be a non-nil pointer")
 	}
 	return s.loadValue(rv.Elem(), relation)
 }
@@ -67,7 +69,7 @@ func (s *Session) Preload(dest any, relations ...string) error {
 
 func (s *Session) loadValue(rv reflect.Value, relation string) error {
 	if !rv.IsValid() {
-		return fmt.Errorf("orm: invalid relation destination")
+		return errkind.New(errkind.KindInvalidSchema, "orm: invalid relation destination")
 	}
 	switch rv.Kind() {
 	case reflect.Struct:
@@ -82,7 +84,7 @@ func (s *Session) loadValue(rv reflect.Value, relation string) error {
 				item = item.Elem()
 			}
 			if item.Kind() != reflect.Struct {
-				return fmt.Errorf("orm: preload destination must contain structs")
+				return errkind.New(errkind.KindInvalidSchema, "orm: preload destination must contain structs")
 			}
 			if err := s.loadStructRelation(item, relation); err != nil {
 				return err
@@ -90,14 +92,14 @@ func (s *Session) loadValue(rv reflect.Value, relation string) error {
 		}
 		return nil
 	default:
-		return fmt.Errorf("orm: preload destination must be a struct or slice")
+		return errkind.New(errkind.KindInvalidSchema, "orm: preload destination must be a struct or slice")
 	}
 }
 
 func (s *Session) loadStructRelation(parent reflect.Value, relation string) error {
 	field, fieldInfo, ok := structFieldByName(parent, relation)
 	if !ok {
-		return fmt.Errorf("orm: relation %q not found", relation)
+		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: relation %q not found", relation))
 	}
 
 	switch field.Kind() {
@@ -106,7 +108,7 @@ func (s *Session) loadStructRelation(parent reflect.Value, relation string) erro
 	case reflect.Slice:
 		return s.loadHasManyRelation(parent, field, fieldInfo, relation)
 	default:
-		return fmt.Errorf("orm: relation %q is not loadable", relation)
+		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: relation %q is not loadable", relation))
 	}
 }
 
@@ -116,12 +118,12 @@ func (s *Session) loadBelongsToRelation(parent, relationField reflect.Value, rel
 		targetType = targetType.Elem()
 	}
 	if targetType.Kind() != reflect.Struct {
-		return fmt.Errorf("orm: relation %q is not a struct or pointer to struct", relation)
+		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: relation %q is not a struct or pointer to struct", relation))
 	}
 
 	fkField, ok := structFieldByCandidates(parent, relation+"ID", relation+"Id", schema.ToSnakeCase(relation)+"_id")
 	if !ok {
-		return fmt.Errorf("orm: parent model missing foreign key for relation %q", relation)
+		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: parent model missing foreign key for relation %q", relation))
 	}
 	if isZeroValue(fkField.Interface()) {
 		relationField.Set(reflect.Zero(relationField.Type()))
@@ -131,15 +133,18 @@ func (s *Session) loadBelongsToRelation(parent, relationField reflect.Value, rel
 	targetTable := s.db.lookupTableForType(targetType)
 	pkCols := primaryKeyColumnsForTable(targetTable)
 	if len(pkCols) != 1 {
-		return fmt.Errorf("orm: relation %q requires a single-column primary key", relation)
+		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: relation %q requires a single-column primary key", relation))
 	}
 
-	sqlText, err := s.db.dialect.RenderSelect(targetTable.Name, quoteColumns(columnsForTable(targetTable), s.db.dialect), []string{quoteIdent(pkCols[0]) + " = " + placeholder(1)}, nil, nil, nil)
+	where := []string{s.db.dialect.QuoteIdent(pkCols[0]) + " = " + s.db.dialect.Placeholder(1)}
+	args := []any{fkField.Interface()}
+	where, args = appendAccessWhere(where, args, accessPredicates(s.ctx, targetTable), s.db.dialect)
+	sqlText, err := s.db.dialect.RenderSelect(targetTable.Name, quoteColumns(columnsForTable(targetTable), s.db.dialect), where, nil, nil, nil)
 	if err != nil {
-		return err
+		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render relation load", err)
 	}
 	targetSlice := reflect.New(reflect.SliceOf(targetType))
-	rows, err := s.db.queryContext(s.ctx, sqlText, fkField.Interface())
+	rows, err := s.db.queryContext(s.ctx, sqlText, args...)
 	if err != nil {
 		return err
 	}
@@ -179,13 +184,13 @@ func (s *Session) loadHasManyRelation(parent, relationField reflect.Value, relat
 		elemType = elemType.Elem()
 	}
 	if elemType.Kind() != reflect.Struct {
-		return fmt.Errorf("orm: relation %q is not a slice of structs", relation)
+		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: relation %q is not a slice of structs", relation))
 	}
 
 	parentTable := s.db.lookupTableForType(parent.Type())
 	parentPKField, ok := primaryKeyField(parent, parentTable)
 	if !ok {
-		return fmt.Errorf("orm: parent model missing primary key for relation %q", relation)
+		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: parent model missing primary key for relation %q", relation))
 	}
 	if isZeroValue(parentPKField.Interface()) {
 		relationField.Set(reflect.MakeSlice(relationField.Type(), 0, 0))
@@ -194,13 +199,15 @@ func (s *Session) loadHasManyRelation(parent, relationField reflect.Value, relat
 
 	childTable := s.db.lookupTableForType(elemType)
 	fkName := schema.ToSnakeCase(parentTable.GoTypeName) + "_id"
-	where := []string{quoteIdent(fkName) + " = " + placeholder(1)}
+	where := []string{s.db.dialect.QuoteIdent(fkName) + " = " + s.db.dialect.Placeholder(1)}
+	args := []any{parentPKField.Interface()}
+	where, args = appendAccessWhere(where, args, accessPredicates(s.ctx, childTable), s.db.dialect)
 	sqlText, err := s.db.dialect.RenderSelect(childTable.Name, quoteColumns(columnsForTable(childTable), s.db.dialect), where, nil, nil, nil)
 	if err != nil {
-		return err
+		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render relation load", err)
 	}
 	targetSlice := reflect.New(relationField.Type())
-	rows, err := s.db.queryContext(s.ctx, sqlText, parentPKField.Interface())
+	rows, err := s.db.queryContext(s.ctx, sqlText, args...)
 	if err != nil {
 		return err
 	}
@@ -297,14 +304,13 @@ func invokeAfterFindHooks(ctx context.Context, rv reflect.Value) error {
 }
 
 func structFieldByName(rv reflect.Value, name string) (reflect.Value, reflect.StructField, bool) {
-	rt := rv.Type()
-	for i := 0; i < rt.NumField(); i++ {
-		field := rt.Field(i)
-		if strings.EqualFold(field.Name, name) || strings.EqualFold(schema.ToSnakeCase(field.Name), schema.ToSnakeCase(name)) {
-			return rv.Field(i), field, true
+	if rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return reflect.Value{}, reflect.StructField{}, false
 		}
+		rv = rv.Elem()
 	}
-	return reflect.Value{}, reflect.StructField{}, false
+	return structFieldByNameRecursive(rv, name)
 }
 
 func structFieldByCandidates(rv reflect.Value, candidates ...string) (reflect.Value, bool) {
@@ -314,6 +320,34 @@ func structFieldByCandidates(rv reflect.Value, candidates ...string) (reflect.Va
 		}
 	}
 	return reflect.Value{}, false
+}
+
+func structFieldByNameRecursive(rv reflect.Value, name string) (reflect.Value, reflect.StructField, bool) {
+	rt := rv.Type()
+	for i := 0; i < rt.NumField(); i++ {
+		field := rt.Field(i)
+		value := rv.Field(i)
+		if strings.EqualFold(field.Name, name) || strings.EqualFold(schema.ToSnakeCase(field.Name), schema.ToSnakeCase(name)) {
+			return value, field, true
+		}
+		if !field.Anonymous {
+			continue
+		}
+		next := value
+		if next.Kind() == reflect.Pointer {
+			if next.IsNil() {
+				continue
+			}
+			next = next.Elem()
+		}
+		if next.Kind() != reflect.Struct {
+			continue
+		}
+		if found, sf, ok := structFieldByNameRecursive(next, name); ok {
+			return found, sf, true
+		}
+	}
+	return reflect.Value{}, reflect.StructField{}, false
 }
 
 func primaryKeyColumnsForTable(table *schema.Table) []string {
@@ -350,9 +384,10 @@ func primaryKeyField(rv reflect.Value, table *schema.Table) (reflect.Value, bool
 }
 
 func (s *Session) queryOneInto(target any, table *schema.Table, where []string, args ...any) error {
+	where, args = appendAccessWhere(where, args, accessPredicates(s.ctx, table), s.db.dialect)
 	sqlText, err := s.db.dialect.RenderSelect(table.Name, quoteColumns(columnsForTable(table), s.db.dialect), where, nil, nil, nil)
 	if err != nil {
-		return err
+		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render query", err)
 	}
 	rows, err := s.db.queryContext(s.ctx, sqlText, args...)
 	if err != nil {
@@ -362,15 +397,29 @@ func (s *Session) queryOneInto(target any, table *schema.Table, where []string, 
 	return scanIntoSlice(rows, target, table)
 }
 
+func appendAccessWhere(where []string, args []any, extra []predicate, d dialect.Dialect) ([]string, []any) {
+	if len(extra) == 0 {
+		return where, args
+	}
+	clauses := make([]string, 0, len(extra))
+	outArgs := append([]any(nil), args...)
+	for _, p := range extra {
+		clause, clauseArgs := bindClause(p.expr, p.args, len(outArgs)+1, d)
+		clauses = append(clauses, clause)
+		outArgs = append(outArgs, clauseArgs...)
+	}
+	return append(where, clauses...), outArgs
+}
+
 func ensurePointerToStructOrSlice(v reflect.Value) error {
 	if v.Kind() != reflect.Pointer || v.IsNil() {
-		return fmt.Errorf("orm: destination must be a non-nil pointer")
+		return errkind.New(errkind.KindConfiguration, "orm: destination must be a non-nil pointer")
 	}
 	switch v.Elem().Kind() {
 	case reflect.Struct, reflect.Slice:
 		return nil
 	default:
-		return fmt.Errorf("orm: destination must point to a struct or slice")
+		return errkind.New(errkind.KindInvalidSchema, "orm: destination must point to a struct or slice")
 	}
 }
 

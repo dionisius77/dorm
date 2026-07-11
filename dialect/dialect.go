@@ -2,6 +2,7 @@ package dialect
 
 import "github.com/dionisius77/dorm/schema"
 
+// Capabilities describes features supported by a SQL dialect.
 type Capabilities struct {
 	UUID               bool
 	JSONB              bool
@@ -19,6 +20,7 @@ type Capabilities struct {
 	PreparedStatements bool
 }
 
+// Dialect renders SQL for a specific database flavor.
 type Dialect interface {
 	Name() string
 	QuoteIdent(string) string

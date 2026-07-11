@@ -3,45 +3,56 @@ package schema
 import (
 	"context"
 	"database/sql"
-	"fmt"
 	"sort"
 	"strings"
+
+	"github.com/dionisius77/dorm/errkind"
 )
 
 type Inspector interface {
 	Inspect(ctx context.Context, db *sql.DB, schemaName string) (*Schema, error)
 }
 
+// PostgresInspector inspects PostgreSQL metadata into a Schema.
 type PostgresInspector struct{}
 
+// Inspect loads PostgreSQL tables, columns, and indexes for a schema.
 func (PostgresInspector) Inspect(ctx context.Context, db *sql.DB, schemaName string) (*Schema, error) {
-	if db == nil {
-		return nil, fmt.Errorf("schema: nil db")
-	}
-	if schemaName == "" {
-		schemaName = "public"
-	}
-	s := &Schema{Name: schemaName}
-	tables, err := readPostgresTables(ctx, db, schemaName)
+	var result *Schema
+	err := traceOperation(ctx, "db.schema.inspect", func(ctx context.Context) error {
+		if db == nil {
+			return errkind.New(errkind.KindConfiguration, "schema: nil db")
+		}
+		if schemaName == "" {
+			schemaName = "public"
+		}
+		s := &Schema{Name: schemaName}
+		tables, err := readPostgresTables(ctx, db, schemaName)
+		if err != nil {
+			return err
+		}
+		cols, err := readPostgresColumns(ctx, db, schemaName)
+		if err != nil {
+			return err
+		}
+		idx, err := readPostgresIndexes(ctx, db, schemaName)
+		if err != nil {
+			return err
+		}
+		for _, tableName := range tables {
+			table := &Table{Name: tableName}
+			table.Columns = cols[tableName]
+			table.Indexes = idx[tableName]
+			s.Tables = append(s.Tables, table)
+		}
+		s.Sort()
+		result = s
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
-	cols, err := readPostgresColumns(ctx, db, schemaName)
-	if err != nil {
-		return nil, err
-	}
-	idx, err := readPostgresIndexes(ctx, db, schemaName)
-	if err != nil {
-		return nil, err
-	}
-	for _, tableName := range tables {
-		table := &Table{Name: tableName}
-		table.Columns = cols[tableName]
-		table.Indexes = idx[tableName]
-		s.Tables = append(s.Tables, table)
-	}
-	s.Sort()
-	return s, nil
+	return result, nil
 }
 
 func readPostgresTables(ctx context.Context, db *sql.DB, schemaName string) ([]string, error) {
@@ -52,18 +63,21 @@ func readPostgresTables(ctx context.Context, db *sql.DB, schemaName string) ([]s
 		ORDER BY table_name
 	`, schemaName)
 	if err != nil {
-		return nil, err
+		return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres tables", err)
 	}
 	defer rows.Close()
 	var out []string
 	for rows.Next() {
 		var name string
 		if err := rows.Scan(&name); err != nil {
-			return nil, err
+			return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres tables", err)
 		}
 		out = append(out, name)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres tables", err)
+	}
+	return out, nil
 }
 
 func readPostgresColumns(ctx context.Context, db *sql.DB, schemaName string) (map[string][]*Column, error) {
@@ -74,14 +88,14 @@ func readPostgresColumns(ctx context.Context, db *sql.DB, schemaName string) (ma
 		ORDER BY table_name, ordinal_position
 	`, schemaName)
 	if err != nil {
-		return nil, err
+		return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres columns", err)
 	}
 	defer rows.Close()
 	out := map[string][]*Column{}
 	for rows.Next() {
 		var tableName, columnName, isNullable, dataType, udtName, columnDefault string
 		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &udtName, &columnDefault); err != nil {
-			return nil, err
+			return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres columns", err)
 		}
 		typ := dataType
 		if udtName != "" {
@@ -95,7 +109,10 @@ func readPostgresColumns(ctx context.Context, db *sql.DB, schemaName string) (ma
 		}
 		out[tableName] = append(out[tableName], col)
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres columns", err)
+	}
+	return out, nil
 }
 
 func readPostgresIndexes(ctx context.Context, db *sql.DB, schemaName string) (map[string][]*Index, error) {
@@ -106,19 +123,22 @@ func readPostgresIndexes(ctx context.Context, db *sql.DB, schemaName string) (ma
 		ORDER BY tablename, indexname
 	`, schemaName)
 	if err != nil {
-		return nil, err
+		return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres indexes", err)
 	}
 	defer rows.Close()
 	out := map[string][]*Index{}
 	for rows.Next() {
 		var tableName, indexName, indexDef string
 		if err := rows.Scan(&tableName, &indexName, &indexDef); err != nil {
-			return nil, err
+			return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres indexes", err)
 		}
 		out[tableName] = append(out[tableName], &Index{Name: indexName, Metadata: map[string]string{"definition": indexDef}})
 	}
 	for _, indexes := range out {
 		sort.SliceStable(indexes, func(i, j int) bool { return indexes[i].Name < indexes[j].Name })
 	}
-	return out, rows.Err()
+	if err := rows.Err(); err != nil {
+		return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres indexes", err)
+	}
+	return out, nil
 }

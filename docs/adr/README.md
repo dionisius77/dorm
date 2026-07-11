@@ -25,3 +25,6 @@ This directory contains the architectural contract for the ORM.
 - [ADR-019: Naming and Coding Conventions](./ADR-019-naming-and-coding-conventions.md)
 - [ADR-020: Security Model](./ADR-020-security-model.md)
 - [ADR-021: Observability & OpenTelemetry](./ADR-021-observability-opentelemetry.md)
+- [ADR-022: Connection Layer & Driver Architecture](./ADR-022-connection-layer-driver-architecture.md)
+- [ADR-023: Access Policy & Security Boundaries](./ADR-023-access-policy-security-boundaries.md)
+- [ADR-024: Composable Model Traits](./ADR-024-composable-model-traits.md)

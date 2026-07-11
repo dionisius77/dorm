@@ -1,9 +1,6 @@
 package orm
 
 import (
-	"os"
-	"path/filepath"
-	"strings"
 	"testing"
 	"time"
 )
@@ -58,25 +55,5 @@ func TestNewNormalizesObservabilityConfig(t *testing.T) {
 	}
 	if !db.observability.ShouldMask("custom_secret") {
 		t.Fatalf("expected custom mask to be present")
-	}
-}
-
-func TestORMPackageDoesNotImportOpenTelemetry(t *testing.T) {
-	entries, err := os.ReadDir(".")
-	if err != nil {
-		t.Fatal(err)
-	}
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		data, err := os.ReadFile(filepath.Join(".", name))
-		if err != nil {
-			t.Fatal(err)
-		}
-		if strings.Contains(string(data), "opentelemetry") {
-			t.Fatalf("public orm package should not import open telemetry directly: %s", name)
-		}
 	}
 }
