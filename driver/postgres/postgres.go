@@ -7,15 +7,19 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/dionisius77/dorm/dialect"
 	pgdialect "github.com/dionisius77/dorm/dialect/postgres"
 	"github.com/dionisius77/dorm/driver"
 	"github.com/dionisius77/dorm/errkind"
+	"github.com/jackc/pgx/v5/stdlib"
 )
 
 const defaultDriverName = "postgres"
+
+var registeredDrivers sync.Map
 
 type Config struct {
 	DSN             string
@@ -119,6 +123,7 @@ func (d *Driver) Open(ctx context.Context) (*sql.DB, error) {
 	if err := d.Validate(); err != nil {
 		return nil, err
 	}
+	ensureRegistered(d.Name())
 	db, err := sql.Open(d.Name(), d.dsn())
 	if err != nil {
 		return nil, errkind.Wrap(errkind.KindConfiguration, "postgres driver: open database", err)
@@ -136,6 +141,29 @@ func (d *Driver) Open(ctx context.Context) (*sql.DB, error) {
 		db.SetConnMaxIdleTime(d.cfg.ConnMaxIdleTime)
 	}
 	return db, nil
+}
+
+func ensureRegistered(name string) {
+	name = strings.TrimSpace(name)
+	if name == "" {
+		name = defaultDriverName
+	}
+	if _, loaded := registeredDrivers.LoadOrStore(name, struct{}{}); loaded {
+		return
+	}
+	if sqlDriverRegistered(name) {
+		return
+	}
+	sql.Register(name, stdlib.GetDefaultDriver())
+}
+
+func sqlDriverRegistered(name string) bool {
+	for _, registered := range sql.Drivers() {
+		if registered == name {
+			return true
+		}
+	}
+	return false
 }
 
 func (d *Driver) dsn() string {
