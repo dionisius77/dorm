@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/dionisius77/dorm/dialect"
+	"github.com/dionisius77/dorm/errkind"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -42,154 +43,172 @@ func NewService(cfg Config) *Service {
 }
 
 func (s *Service) Generate(ctx context.Context) (*Result, error) {
-	if s == nil {
-		return nil, fmt.Errorf("migrate: nil service")
-	}
-	if s.Config.Dialect == nil {
-		return nil, fmt.Errorf("migrate: nil dialect")
-	}
-	builder := schema.NewBuilder(s.Config.Root)
-	current, err := builder.Build(ctx)
-	if err != nil {
-		return nil, err
-	}
-	var previous *schema.Schema
-	if s.Config.SnapshotPath != "" {
-		if snap, err := schema.LoadSnapshot(s.Config.SnapshotPath); err == nil && snap != nil {
-			previous = snap.Schema
+	var result *Result
+	err := traceOperation(ctx, "db.migration.generate", func(ctx context.Context) error {
+		if s == nil {
+			return errkind.New(errkind.KindConfiguration, "migrate: nil service")
 		}
-	}
-	if previous == nil {
-		previous = &schema.Schema{Name: current.Name}
-	}
-	diff, err := schema.Compare(current, previous)
-	if err != nil {
-		return nil, err
-	}
-	if diff.Empty() {
-		return &Result{Diff: diff, Snapshot: &schema.Snapshot{GeneratedAt: time.Now().UTC(), Schema: current}}, nil
-	}
-	upSQL, err := s.Config.Dialect.RenderMigration(diff)
-	if err != nil {
-		return nil, err
-	}
-	downDiff := invertDiff(diff)
-	downSQL, err := s.Config.Dialect.RenderMigration(downDiff)
-	if err != nil {
-		return nil, err
-	}
-	name := s.nextMigrationName()
-	snapshot := &schema.Snapshot{GeneratedAt: time.Now().UTC(), Schema: current}
-	return &Result{
-		MigrationName: name,
-		UpSQL:         upSQL,
-		DownSQL:       downSQL,
-		Diff:          diff,
-		Snapshot:      snapshot,
-	}, nil
-}
-
-func (s *Service) Write(result *Result) error {
-	if s == nil {
-		return fmt.Errorf("migrate: nil service")
-	}
-	if result == nil {
-		return fmt.Errorf("migrate: nil result")
-	}
-	if s.Config.MigrationsDir == "" {
-		return fmt.Errorf("migrate: empty migrations dir")
-	}
-	if err := os.MkdirAll(s.Config.MigrationsDir, 0o755); err != nil {
-		return err
-	}
-	if result.MigrationName == "" {
-		result.MigrationName = s.nextMigrationName()
-	}
-	upPath := filepath.Join(s.Config.MigrationsDir, result.MigrationName+".up.sql")
-	downPath := filepath.Join(s.Config.MigrationsDir, result.MigrationName+".down.sql")
-	if err := os.WriteFile(upPath, []byte(strings.Join(result.UpSQL, "\n\n")+"\n"), 0o644); err != nil {
-		return err
-	}
-	if err := os.WriteFile(downPath, []byte(strings.Join(result.DownSQL, "\n\n")+"\n"), 0o644); err != nil {
-		return err
-	}
-	if s.Config.SnapshotPath != "" && result.Snapshot != nil {
-		if err := schema.SaveSnapshot(s.Config.SnapshotPath, result.Snapshot); err != nil {
-			return err
+		if s.Config.Dialect == nil {
+			return errkind.New(errkind.KindConfiguration, "migrate: nil dialect")
 		}
-	}
-	return nil
-}
-
-func (s *Service) Run(ctx context.Context, db *sql.DB) error {
-	if s == nil {
-		return fmt.Errorf("migrate: nil service")
-	}
-	if db == nil {
-		return fmt.Errorf("migrate: nil db")
-	}
-	if s.Config.MigrationsDir == "" {
-		return fmt.Errorf("migrate: empty migrations dir")
-	}
-	if err := ensureMigrationRegistry(ctx, db); err != nil {
-		return err
-	}
-	applied, err := appliedMigrationSet(ctx, db)
-	if err != nil {
-		return err
-	}
-	files, err := filepath.Glob(filepath.Join(s.Config.MigrationsDir, "*.up.sql"))
-	if err != nil {
-		return err
-	}
-	sort.Strings(files)
-	for _, file := range files {
-		name := strings.TrimSuffix(filepath.Base(file), ".up.sql")
-		if applied[name] {
-			continue
-		}
-		sqlBytes, err := os.ReadFile(file)
+		builder := schema.NewBuilder(s.Config.Root)
+		current, err := builder.Build(ctx)
 		if err != nil {
 			return err
 		}
-		if _, err := db.ExecContext(ctx, string(sqlBytes)); err != nil {
-			return fmt.Errorf("migrate: apply %s: %w", filepath.Base(file), err)
+		var previous *schema.Schema
+		if s.Config.SnapshotPath != "" {
+			if snap, err := schema.LoadSnapshot(s.Config.SnapshotPath); err == nil && snap != nil {
+				previous = snap.Schema
+			}
 		}
-		if err := recordAppliedMigration(ctx, db, name, checksum(sqlBytes)); err != nil {
+		if previous == nil {
+			previous = &schema.Schema{Name: current.Name}
+		}
+		diff, err := schema.Compare(current, previous)
+		if err != nil {
 			return err
 		}
+		if diff.Empty() {
+			result = &Result{Diff: diff, Snapshot: &schema.Snapshot{GeneratedAt: time.Now().UTC(), Schema: current}}
+			return nil
+		}
+		upSQL, err := s.Config.Dialect.RenderMigration(diff)
+		if err != nil {
+			return errkind.Wrap(errkind.KindUnsupportedFeature, "migrate: render migration", err)
+		}
+		downDiff := invertDiff(diff)
+		downSQL, err := s.Config.Dialect.RenderMigration(downDiff)
+		if err != nil {
+			return errkind.Wrap(errkind.KindUnsupportedFeature, "migrate: render rollback migration", err)
+		}
+		name := s.nextMigrationName()
+		snapshot := &schema.Snapshot{GeneratedAt: time.Now().UTC(), Schema: current}
+		result = &Result{
+			MigrationName: name,
+			UpSQL:         upSQL,
+			DownSQL:       downSQL,
+			Diff:          diff,
+			Snapshot:      snapshot,
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
 	}
-	return nil
+	return result, nil
+}
+
+func (s *Service) Write(result *Result) error {
+	return traceOperation(context.Background(), "db.migration.write", func(context.Context) error {
+		if s == nil {
+			return errkind.New(errkind.KindConfiguration, "migrate: nil service")
+		}
+		if result == nil {
+			return errkind.New(errkind.KindConfiguration, "migrate: nil result")
+		}
+		if s.Config.MigrationsDir == "" {
+			return errkind.New(errkind.KindConfiguration, "migrate: empty migrations dir")
+		}
+		if err := os.MkdirAll(s.Config.MigrationsDir, 0o755); err != nil {
+			return errkind.Wrap(errkind.KindMigrationGeneration, "migrate: create migrations dir", err)
+		}
+		if result.MigrationName == "" {
+			result.MigrationName = s.nextMigrationName()
+		}
+		upPath := filepath.Join(s.Config.MigrationsDir, result.MigrationName+".up.sql")
+		downPath := filepath.Join(s.Config.MigrationsDir, result.MigrationName+".down.sql")
+		if err := os.WriteFile(upPath, []byte(strings.Join(result.UpSQL, "\n\n")+"\n"), 0o644); err != nil {
+			return errkind.Wrap(errkind.KindMigrationGeneration, "migrate: write up migration", err)
+		}
+		if err := os.WriteFile(downPath, []byte(strings.Join(result.DownSQL, "\n\n")+"\n"), 0o644); err != nil {
+			return errkind.Wrap(errkind.KindMigrationGeneration, "migrate: write down migration", err)
+		}
+		if s.Config.SnapshotPath != "" && result.Snapshot != nil {
+			if err := schema.SaveSnapshot(s.Config.SnapshotPath, result.Snapshot); err != nil {
+				return errkind.Wrap(errkind.KindMigrationGeneration, "migrate: save snapshot", err)
+			}
+		}
+		return nil
+	})
+}
+
+func (s *Service) Run(ctx context.Context, db *sql.DB) error {
+	return traceOperation(ctx, "db.migration.run", func(ctx context.Context) error {
+		if s == nil {
+			return errkind.New(errkind.KindConfiguration, "migrate: nil service")
+		}
+		if db == nil {
+			return errkind.New(errkind.KindConfiguration, "migrate: nil db")
+		}
+		if s.Config.MigrationsDir == "" {
+			return errkind.New(errkind.KindConfiguration, "migrate: empty migrations dir")
+		}
+		if err := ensureMigrationRegistry(ctx, db); err != nil {
+			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: ensure registry", err)
+		}
+		applied, err := appliedMigrationSet(ctx, db)
+		if err != nil {
+			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: read applied migrations", err)
+		}
+		files, err := filepath.Glob(filepath.Join(s.Config.MigrationsDir, "*.up.sql"))
+		if err != nil {
+			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: glob migrations", err)
+		}
+		sort.Strings(files)
+		for _, file := range files {
+			name := strings.TrimSuffix(filepath.Base(file), ".up.sql")
+			if applied[name] {
+				continue
+			}
+			sqlBytes, err := os.ReadFile(file)
+			if err != nil {
+				return errkind.Wrap(errkind.KindMigrationApplication, "migrate: read migration file", err)
+			}
+			if _, err := db.ExecContext(ctx, string(sqlBytes)); err != nil {
+				return errkind.Wrap(errkind.KindMigrationApplication, fmt.Sprintf("migrate: apply %s", filepath.Base(file)), err)
+			}
+			if err := recordAppliedMigration(ctx, db, name, checksum(sqlBytes)); err != nil {
+				return errkind.Wrap(errkind.KindMigrationApplication, "migrate: record applied migration", err)
+			}
+		}
+		return nil
+	})
 }
 
 func (s *Service) Revert(ctx context.Context, db *sql.DB, name string) error {
-	if s == nil {
-		return fmt.Errorf("migrate: nil service")
-	}
-	if db == nil {
-		return fmt.Errorf("migrate: nil db")
-	}
-	if name == "" {
-		return fmt.Errorf("migrate: empty migration name")
-	}
-	path := filepath.Join(s.Config.MigrationsDir, name+".down.sql")
-	sqlBytes, err := os.ReadFile(path)
-	if err != nil {
-		return err
-	}
-	if _, err = db.ExecContext(ctx, string(sqlBytes)); err != nil {
-		return err
-	}
-	return removeAppliedMigration(ctx, db, name)
+	return traceOperation(ctx, "db.migration.revert", func(ctx context.Context) error {
+		if s == nil {
+			return errkind.New(errkind.KindConfiguration, "migrate: nil service")
+		}
+		if db == nil {
+			return errkind.New(errkind.KindConfiguration, "migrate: nil db")
+		}
+		if name == "" {
+			return errkind.New(errkind.KindConfiguration, "migrate: empty migration name")
+		}
+		path := filepath.Join(s.Config.MigrationsDir, name+".down.sql")
+		sqlBytes, err := os.ReadFile(path)
+		if err != nil {
+			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: read down migration", err)
+		}
+		if _, err = db.ExecContext(ctx, string(sqlBytes)); err != nil {
+			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: revert migration", err)
+		}
+		if err := removeAppliedMigration(ctx, db, name); err != nil {
+			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: remove applied migration", err)
+		}
+		return nil
+	})
 }
 
 func (s *Service) Status() ([]string, error) {
 	if s == nil {
-		return nil, fmt.Errorf("migrate: nil service")
+		return nil, errkind.New(errkind.KindConfiguration, "migrate: nil service")
 	}
 	files, err := filepath.Glob(filepath.Join(s.Config.MigrationsDir, "*.up.sql"))
 	if err != nil {
-		return nil, err
+		return nil, errkind.Wrap(errkind.KindConfiguration, "migrate: glob migrations", err)
 	}
 	sort.Strings(files)
 	var names []string

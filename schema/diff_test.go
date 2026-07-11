@@ -1,8 +1,10 @@
 package schema_test
 
 import (
+	"errors"
 	"testing"
 
+	"github.com/dionisius77/dorm/errkind"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -34,5 +36,15 @@ func TestCompareDetectsAddedColumn(t *testing.T) {
 	}
 	if diff.Empty() {
 		t.Fatalf("expected diff")
+	}
+}
+
+func TestCompareReturnsInvalidSchemaError(t *testing.T) {
+	_, err := schema.Compare(nil, nil)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !errors.Is(err, errkind.ErrInvalidSchema) {
+		t.Fatalf("expected invalid schema error, got %T %v", err, err)
 	}
 }

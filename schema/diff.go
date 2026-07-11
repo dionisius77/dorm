@@ -3,6 +3,8 @@ package schema
 import (
 	"fmt"
 	"sort"
+
+	"github.com/dionisius77/dorm/errkind"
 )
 
 type OperationKind string
@@ -37,7 +39,7 @@ func (d Diff) Empty() bool { return len(d.Operations) == 0 }
 
 func Compare(expected, actual *Schema) (*Diff, error) {
 	if expected == nil || actual == nil {
-		return nil, fmt.Errorf("schema: compare requires non-nil schemas")
+		return nil, errkind.New(errkind.KindInvalidSchema, "schema: compare requires non-nil schemas")
 	}
 	expected = expected.Clone()
 	actual = actual.Clone()

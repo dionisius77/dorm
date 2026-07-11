@@ -9,7 +9,10 @@ import (
 	"os"
 	"path/filepath"
 
+	"github.com/dionisius77/dorm"
 	"github.com/dionisius77/dorm/dialect/postgres"
+	driverpostgres "github.com/dionisius77/dorm/driver/postgres"
+	"github.com/dionisius77/dorm/errkind"
 	"github.com/dionisius77/dorm/migrate"
 	"github.com/dionisius77/dorm/schema"
 )
@@ -76,7 +79,7 @@ func cmdMigrate(ctx context.Context, args []string) error {
 	case "revert":
 		return cmdMigrateRevert(ctx, args[1:])
 	case "status":
-		return cmdMigrateStatus(args[1:])
+		return cmdMigrateStatus(ctx, args[1:])
 	default:
 		return usage()
 	}
@@ -117,7 +120,7 @@ func cmdMigrateRun(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	db, err := sql.Open(cfg.Driver, cfg.DSN)
+	db, err := openConfiguredDB(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -130,7 +133,7 @@ func cmdMigrateRun(ctx context.Context, args []string) error {
 		Dialect:       postgres.New(),
 		Inspector:     schema.PostgresInspector{},
 	})
-	return service.Run(ctx, db)
+	return service.Run(ctx, db.SQLDB())
 }
 
 func cmdMigrateRevert(ctx context.Context, args []string) error {
@@ -141,13 +144,13 @@ func cmdMigrateRevert(ctx context.Context, args []string) error {
 		return err
 	}
 	if *name == "" {
-		return fmt.Errorf("migrate revert requires --name")
+		return errkind.New(errkind.KindConfiguration, "migrate revert requires --name")
 	}
 	cfg, err := loadConfig(filepath.Join(*root, defaultConfig().ConfigFile))
 	if err != nil {
 		return err
 	}
-	db, err := sql.Open(cfg.Driver, cfg.DSN)
+	db, err := openConfiguredDB(ctx, cfg)
 	if err != nil {
 		return err
 	}
@@ -160,16 +163,31 @@ func cmdMigrateRevert(ctx context.Context, args []string) error {
 		Dialect:       postgres.New(),
 		Inspector:     schema.PostgresInspector{},
 	})
-	return service.Revert(ctx, db, *name)
+	return service.Revert(ctx, db.SQLDB(), *name)
 }
 
-func cmdMigrateStatus(args []string) error {
+func cmdMigrateStatus(ctx context.Context, args []string) error {
 	fs := flag.NewFlagSet("migrate status", flag.ContinueOnError)
 	root := fs.String("root", ".", "project root")
 	if err := fs.Parse(args); err != nil {
 		return err
 	}
 	cfg, err := loadConfig(filepath.Join(*root, defaultConfig().ConfigFile))
+	if err != nil {
+		return err
+	}
+	db, err := openConfiguredDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.PingContext(context.Background()); err != nil {
+		return err
+	}
+	if err := ensureMigrationRegistry(context.Background(), db.SQLDB()); err != nil {
+		return err
+	}
+	applied, err := appliedMigrationSet(context.Background(), db.SQLDB())
 	if err != nil {
 		return err
 	}
@@ -185,8 +203,17 @@ func cmdMigrateStatus(args []string) error {
 	if err != nil {
 		return err
 	}
+	fmt.Fprintln(os.Stdout, "applied:")
 	for _, name := range names {
-		fmt.Println(name)
+		if applied[name] {
+			fmt.Fprintf(os.Stdout, "- %s\n", name)
+		}
+	}
+	fmt.Fprintln(os.Stdout, "pending:")
+	for _, name := range names {
+		if !applied[name] {
+			fmt.Fprintf(os.Stdout, "- %s\n", name)
+		}
 	}
 	return nil
 }
@@ -213,44 +240,86 @@ func cmdSchemaCheck(ctx context.Context, args []string) error {
 	if err != nil {
 		return err
 	}
-	service := migrate.NewService(migrate.Config{
-		Root:          filepath.Join(*root, cfg.ModelsDir),
-		MigrationsDir: filepath.Join(*root, cfg.MigrationsDir),
-		SnapshotPath:  filepath.Join(*root, cfg.SnapshotPath),
-		SchemaName:    cfg.SchemaName,
-		Dialect:       postgres.New(),
-		Inspector:     schema.PostgresInspector{},
-	})
-	generated, err := service.Generate(ctx)
+	db, err := openConfiguredDB(ctx, cfg)
 	if err != nil {
 		return err
 	}
-	if generated.Diff != nil && !generated.Diff.Empty() {
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return err
+	}
+	report, err := schema.DetectDriftFromSource(
+		ctx,
+		filepath.Join(*root, cfg.ModelsDir),
+		schema.PostgresInspector{},
+		db.SQLDB(),
+		cfg.SchemaName,
+		filepath.Join(*root, cfg.SnapshotPath),
+	)
+	if err != nil {
+		return err
+	}
+	if report != nil && !report.Clean() {
 		fmt.Fprintln(os.Stdout, "Schema Drift Detected")
-		for _, op := range generated.Diff.Operations {
-			fmt.Fprintf(os.Stdout, "- %s %s\n", op.Kind, op.Table)
+		if report.ExpectedDiff != nil {
+			for _, op := range report.ExpectedDiff.Operations {
+				fmt.Fprintf(os.Stdout, "- %s %s\n", op.Kind, op.Table)
+			}
 		}
-		return fmt.Errorf("schema drift detected")
+		if report.HasSnapshotDrift() {
+			fmt.Fprintln(os.Stdout, "Snapshot Drift Detected")
+			for _, op := range report.SnapshotDiff.Operations {
+				fmt.Fprintf(os.Stdout, "- %s %s\n", op.Kind, op.Table)
+			}
+		}
+		return errkind.New(errkind.KindInvalidSchema, "schema drift detected")
 	}
 	fmt.Fprintln(os.Stdout, "Schema OK")
 	return nil
 }
 
 func cmdDoctor(ctx context.Context, args []string) error {
-	_ = ctx
 	fs := flag.NewFlagSet("doctor", flag.ContinueOnError)
 	root := fs.String("root", ".", "project root")
 	if err := fs.Parse(args); err != nil {
 		return err
+	}
+	if err := dorm.DefaultCompatibilityPolicy().ValidateRuntime(); err != nil {
+		return errkind.Wrap(errkind.KindUnsupportedFeature, "doctor: compatibility check failed", err)
 	}
 	cfg, err := loadConfig(filepath.Join(*root, defaultConfig().ConfigFile))
 	if err != nil {
 		return err
 	}
 	if cfg.Root == "" || cfg.MigrationsDir == "" || cfg.SnapshotPath == "" {
-		return fmt.Errorf("doctor: incomplete config")
+		return errkind.New(errkind.KindConfiguration, "doctor: incomplete config")
 	}
+	if cfg.Driver != postgres.New().Name() {
+		return errkind.New(errkind.KindUnsupportedFeature, fmt.Sprintf("doctor: unsupported driver %q", cfg.Driver))
+	}
+	snapshot, err := schema.LoadSnapshot(filepath.Join(*root, cfg.SnapshotPath))
+	if err != nil {
+		return errkind.Wrap(errkind.KindInvalidSchema, "doctor: snapshot integrity check failed", err)
+	}
+	if snapshot == nil || snapshot.Schema == nil {
+		return errkind.New(errkind.KindInvalidSchema, "doctor: snapshot integrity check failed: empty snapshot")
+	}
+	if err := snapshot.Schema.Validate(); err != nil {
+		return errkind.Wrap(errkind.KindInvalidSchema, "doctor: snapshot integrity check failed", err)
+	}
+	db, err := openConfiguredDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return errkind.Wrap(errkind.KindRuntimeQuery, "doctor: connectivity check failed", err)
+	}
+	fmt.Println("doctor: compatibility ok")
 	fmt.Println("doctor: config ok")
+	fmt.Println("doctor: connectivity ok")
+	fmt.Println("doctor: snapshot ok")
+	fmt.Println("doctor: dialect ok")
 	return nil
 }
 
@@ -308,4 +377,41 @@ func jsonMarshalIndent(v any) ([]byte, error) {
 
 func jsonUnmarshal(data []byte, v any) error {
 	return json.Unmarshal(data, v)
+}
+
+func openConfiguredDB(ctx context.Context, cfg cliConfig) (*dorm.DB, error) {
+	driver := driverpostgres.New(driverpostgres.Config{
+		DSN:        cfg.DSN,
+		DriverName: cfg.Driver,
+	})
+	dorm.RegisterDriver(driver)
+	return dorm.Open(ctx, driver)
+}
+
+func ensureMigrationRegistry(ctx context.Context, db *sql.DB) error {
+	_, err := db.ExecContext(ctx, `
+		CREATE TABLE IF NOT EXISTS orm_migrations (
+			name text PRIMARY KEY,
+			applied_at timestamptz NOT NULL DEFAULT now(),
+			checksum text NOT NULL
+		)
+	`)
+	return err
+}
+
+func appliedMigrationSet(ctx context.Context, db *sql.DB) (map[string]bool, error) {
+	rows, err := db.QueryContext(ctx, `SELECT name FROM orm_migrations ORDER BY name`)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	out := map[string]bool{}
+	for rows.Next() {
+		var name string
+		if err := rows.Scan(&name); err != nil {
+			return nil, err
+		}
+		out[name] = true
+	}
+	return out, rows.Err()
 }

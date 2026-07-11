@@ -2,10 +2,11 @@ package schema
 
 import (
 	"encoding/json"
-	"fmt"
 	"os"
 	"path/filepath"
 	"time"
+
+	"github.com/dionisius77/dorm/errkind"
 )
 
 type Snapshot struct {
@@ -18,6 +19,10 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 	if err != nil {
 		return nil, err
 	}
+	fingerprint := fingerprintBytes(data)
+	if cached, ok := loadCachedSnapshot(path, fingerprint); ok {
+		return cached, nil
+	}
 	var snap Snapshot
 	if err := json.Unmarshal(data, &snap); err != nil {
 		return nil, err
@@ -25,12 +30,13 @@ func LoadSnapshot(path string) (*Snapshot, error) {
 	if snap.Schema != nil {
 		snap.Schema.Sort()
 	}
-	return &snap, nil
+	storeCachedSnapshot(path, fingerprint, &snap)
+	return snap.Clone(), nil
 }
 
 func SaveSnapshot(path string, snap *Snapshot) error {
 	if snap == nil {
-		return fmt.Errorf("schema: nil snapshot")
+		return errkind.New(errkind.KindConfiguration, "schema: nil snapshot")
 	}
 	if snap.Schema != nil {
 		snap.Schema.Sort()
@@ -49,5 +55,9 @@ func SaveSnapshot(path string, snap *Snapshot) error {
 	if err := os.WriteFile(tmp, data, 0o644); err != nil {
 		return err
 	}
-	return os.Rename(tmp, path)
+	if err := os.Rename(tmp, path); err != nil {
+		return err
+	}
+	storeCachedSnapshot(path, fingerprintBytes(data), snap)
+	return nil
 }

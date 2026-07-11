@@ -12,10 +12,15 @@ import (
 
 	"github.com/dionisius77/dorm/access"
 	"github.com/dionisius77/dorm/dialect"
+	"github.com/dionisius77/dorm/errkind"
 	"github.com/dionisius77/dorm/schema"
 )
 
 var ErrNotFound = errors.New("orm: not found")
+
+var (
+	tableMetaCache  sync.Map // map[reflect.Type]*schema.Table
+)
 
 type Logger interface {
 	Printf(string, ...any)
@@ -77,27 +82,60 @@ func (db *DB) WithContext(ctx context.Context) *Session {
 	return &Session{db: db, ctx: ctx}
 }
 
+func (db *DB) WithPolicy(policy access.Policy) *Session {
+	return (&Session{db: db}).WithPolicy(policy)
+}
+
 func (s *Session) WithDeleted() *Session {
+	if s == nil {
+		return &Session{withDeleted: true}
+	}
 	cp := *s
 	cp.withDeleted = true
 	return &cp
 }
 
+func (s *Session) WithContext(ctx context.Context) *Session {
+	if s == nil {
+		return &Session{ctx: ctx}
+	}
+	cp := *s
+	cp.ctx = access.WithPolicy(ctx, access.PolicyFromContext(s.ctx))
+	return &cp
+}
+
+func (s *Session) WithPolicy(policy access.Policy) *Session {
+	if s == nil {
+		return &Session{ctx: access.WithPolicy(context.Background(), policy)}
+	}
+	cp := *s
+	cp.ctx = access.WithPolicy(cp.ctx, policy)
+	return &cp
+}
+
 func (s *Session) Find(dest any, opts ...QueryOption) error {
-	state, err := s.buildState(dest, opts...)
-	if err != nil {
-		return err
-	}
-	sqlText, args, err := s.db.buildSelectSQL(s.ctx, state)
-	if err != nil {
-		return err
-	}
-	rows, err := s.db.queryContext(s.ctx, sqlText, args...)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-	return scanIntoSlice(rows, dest, state.table)
+	return s.db.traceOperation(s.ctx, "db.query", []Attribute{{Key: "orm.operation", Value: "find"}}, func(ctx context.Context) error {
+		if err := invokeBeforeFindHook(ctx, dest); err != nil {
+			return err
+		}
+		state, err := s.buildState(dest, opts...)
+		if err != nil {
+			return err
+		}
+		sqlText, args, err := s.db.buildSelectSQL(ctx, state)
+		if err != nil {
+			return err
+		}
+		rows, err := s.db.queryContext(ctx, sqlText, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		if err := scanIntoSlice(rows, dest, state.table); err != nil {
+			return err
+		}
+		return invokeAfterFindHooks(ctx, reflect.ValueOf(dest).Elem())
+	})
 }
 
 func (s *Session) FindOne(dest any, opts ...QueryOption) error {
@@ -113,126 +151,165 @@ func (s *Session) FindOne(dest any, opts ...QueryOption) error {
 }
 
 func (s *Session) Create(model any) error {
-	meta, rv, err := s.resolveModel(model)
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	table := meta.table
-	values := map[string]any{}
-	if err := populateAuditAndScope(s.ctx, table, rv, values, now, access.OpInsert); err != nil {
-		return err
-	}
-	if err := applyStructFieldValues(table, rv, values, now, true); err != nil {
-		return err
-	}
-	cols, args := orderedColumnsAndArgs(table, values, true)
-	if len(cols) == 0 {
-		return fmt.Errorf("orm: no insertable columns for %s", table.Name)
-	}
-	sqlText, err := s.db.dialect.RenderInsert(table.Name, cols, returningColumns(table))
-	if err != nil {
-		return err
-	}
-	return s.db.execReturning(s.ctx, sqlText, args, model, table)
+	return s.db.traceOperation(s.ctx, "db.insert", []Attribute{{Key: "orm.operation", Value: "create"}}, func(ctx context.Context) error {
+		s.db.logPolicyOverride(ctx)
+		if err := invokeBeforeCreateHook(ctx, model); err != nil {
+			return err
+		}
+		meta, rv, err := s.resolveModel(model)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		table := meta.table
+		values := map[string]any{}
+		if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpInsert); err != nil {
+			return err
+		}
+		if err := applyStructFieldValues(ctx, table, rv, values, now, true); err != nil {
+			return err
+		}
+		cols, args := orderedColumnsAndArgs(table, values, true)
+		if len(cols) == 0 {
+			return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: no insertable columns for %s", table.Name))
+		}
+		sqlText, err := s.db.dialect.RenderInsert(table.Name, cols, returningColumns(table))
+		if err != nil {
+			return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render insert", err)
+		}
+		if err := s.db.execReturning(ctx, sqlText, args, model, table); err != nil {
+			return err
+		}
+		return invokeAfterCreateHook(ctx, model)
+	})
 }
 
 func (s *Session) Update(model any) error {
-	meta, rv, err := s.resolveModel(model)
-	if err != nil {
-		return err
-	}
-	now := time.Now().UTC()
-	table := meta.table
-	values := map[string]any{}
-	if err := populateAuditAndScope(s.ctx, table, rv, values, now, access.OpUpdate); err != nil {
-		return err
-	}
-	if err := applyStructFieldValues(table, rv, values, now, false); err != nil {
-		return err
-	}
-	pkCols, pkArgs, err := primaryKeyValues(table, rv)
-	if err != nil {
-		return err
-	}
-	if len(pkCols) == 0 {
-		return fmt.Errorf("orm: update requires primary key")
-	}
-	set, args := updateSetClauses(table, values, pkCols)
-	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(s.ctx, table))
-	sqlText, err := s.db.dialect.RenderUpdate(table.Name, set, whereSQL, returningColumns(table))
-	if err != nil {
-		return err
-	}
-	return s.db.execReturning(s.ctx, sqlText, append(args, whereArgs...), model, table)
+	return s.db.traceOperation(s.ctx, "db.update", []Attribute{{Key: "orm.operation", Value: "update"}}, func(ctx context.Context) error {
+		s.db.logPolicyOverride(ctx)
+		if err := invokeBeforeUpdateHook(ctx, model); err != nil {
+			return err
+		}
+		meta, rv, err := s.resolveModel(model)
+		if err != nil {
+			return err
+		}
+		now := time.Now().UTC()
+		table := meta.table
+		values := map[string]any{}
+		if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpUpdate); err != nil {
+			return err
+		}
+		if err := applyStructFieldValues(ctx, table, rv, values, now, false); err != nil {
+			return err
+		}
+		pkCols, pkArgs, err := primaryKeyValues(table, rv)
+		if err != nil {
+			return err
+		}
+		if len(pkCols) == 0 {
+			return errkind.New(errkind.KindInvalidSchema, "orm: update requires primary key")
+		}
+		set, args := updateSetClauses(table, values, pkCols, s.db.dialect)
+		whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), s.db.dialect)
+		sqlText, err := s.db.dialect.RenderUpdate(table.Name, set, whereSQL, returningColumns(table))
+		if err != nil {
+			return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render update", err)
+		}
+		if err := s.db.execReturning(ctx, sqlText, append(args, whereArgs...), model, table); err != nil {
+			return err
+		}
+		return invokeAfterUpdateHook(ctx, model)
+	})
 }
 
 func (s *Session) Delete(model any) error {
-	meta, rv, err := s.resolveModel(model)
-	if err != nil {
-		return err
-	}
-	table := meta.table
-	if soft := softDeleteColumn(table); soft != nil {
-		return s.softDelete(model, table, rv, soft)
-	}
-	pkCols, pkArgs, err := primaryKeyValues(table, rv)
-	if err != nil {
-		return err
-	}
-	if len(pkCols) == 0 {
-		return fmt.Errorf("orm: delete requires primary key")
-	}
-	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(s.ctx, table))
-	sqlText, err := s.db.dialect.RenderDelete(table.Name, whereSQL, nil)
-	if err != nil {
-		return err
-	}
-	_, err = s.db.execContext(s.ctx, sqlText, whereArgs...)
-	return err
+	return s.db.traceOperation(s.ctx, "db.delete", []Attribute{{Key: "orm.operation", Value: "delete"}}, func(ctx context.Context) error {
+		s.db.logPolicyOverride(ctx)
+		if err := invokeBeforeDeleteHook(ctx, model); err != nil {
+			return err
+		}
+		meta, rv, err := s.resolveModel(model)
+		if err != nil {
+			return err
+		}
+		table := meta.table
+		if soft := softDeleteColumn(table); soft != nil && access.PolicyFromContext(ctx).EnforcesSoftDelete() {
+			return s.softDelete(model, table, rv, soft)
+		}
+		pkCols, pkArgs, err := primaryKeyValues(table, rv)
+		if err != nil {
+			return err
+		}
+		if len(pkCols) == 0 {
+			return errkind.New(errkind.KindInvalidSchema, "orm: delete requires primary key")
+		}
+		whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), s.db.dialect)
+		sqlText, err := s.db.dialect.RenderDelete(table.Name, whereSQL, nil)
+		if err != nil {
+			return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render delete", err)
+		}
+		_, err = s.db.execContext(ctx, sqlText, whereArgs...)
+		if err != nil {
+			return err
+		}
+		return invokeAfterDeleteHook(ctx, model)
+	})
 }
 
 func (s *Session) SoftDelete(model any) error {
-	meta, rv, err := s.resolveModel(model)
-	if err != nil {
-		return err
-	}
-	table := meta.table
-	soft := softDeleteColumn(table)
-	if soft == nil {
-		return fmt.Errorf("orm: table %s has no soft delete column", table.Name)
-	}
-	return s.softDelete(model, table, rv, soft)
+	return s.db.traceOperation(s.ctx, "db.delete", []Attribute{{Key: "orm.operation", Value: "soft_delete"}}, func(ctx context.Context) error {
+		s.db.logPolicyOverride(ctx)
+		if err := invokeBeforeDeleteHook(ctx, model); err != nil {
+			return err
+		}
+		meta, rv, err := s.resolveModel(model)
+		if err != nil {
+			return err
+		}
+		table := meta.table
+		soft := softDeleteColumn(table)
+		if soft == nil {
+			return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: table %s has no soft delete column", table.Name))
+		}
+		if err := s.softDelete(model, table, rv, soft); err != nil {
+			return err
+		}
+		return invokeAfterDeleteHook(ctx, model)
+	})
 }
 
 func (s *Session) Upsert(model any) error {
-	meta, rv, err := s.resolveModel(model)
-	if err != nil {
-		return err
-	}
-	table := meta.table
-	values := map[string]any{}
-	if err := applyStructFieldValues(table, rv, values, time.Now().UTC(), true); err != nil {
-		return err
-	}
-	if err := populateAuditAndScope(s.ctx, table, rv, values, time.Now().UTC(), access.OpInsert); err != nil {
-		return err
-	}
-	cols, args := orderedColumnsAndArgs(table, values, true)
-	if len(cols) == 0 {
-		return fmt.Errorf("orm: no upsertable columns for %s", table.Name)
-	}
-	conflict := conflictColumns(table)
-	if len(conflict) == 0 {
-		return fmt.Errorf("orm: upsert requires primary key or unique constraint")
-	}
-	insertSQL, err := s.db.dialect.RenderInsert(table.Name, cols, returningColumns(table))
-	if err != nil {
-		return err
-	}
-	set := upsertSetClauses(table, values, conflict)
-	sqlText := strings.TrimSuffix(insertSQL, ";") + " ON CONFLICT (" + strings.Join(quoteColumns(conflict, s.db.dialect), ", ") + ") DO UPDATE SET " + strings.Join(set, ", ") + ";"
-	return s.db.execReturning(s.ctx, sqlText, args, model, table)
+	return s.db.traceOperation(s.ctx, "db.upsert", []Attribute{{Key: "orm.operation", Value: "upsert"}}, func(ctx context.Context) error {
+		s.db.logPolicyOverride(ctx)
+		meta, rv, err := s.resolveModel(model)
+		if err != nil {
+			return err
+		}
+		table := meta.table
+		values := map[string]any{}
+		if err := applyStructFieldValues(ctx, table, rv, values, time.Now().UTC(), true); err != nil {
+			return err
+		}
+		if err := populateAuditAndScope(ctx, table, rv, values, time.Now().UTC(), access.OpInsert); err != nil {
+			return err
+		}
+		cols, args := orderedColumnsAndArgs(table, values, true)
+		if len(cols) == 0 {
+			return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: no upsertable columns for %s", table.Name))
+		}
+		conflict := conflictColumns(table)
+		if len(conflict) == 0 {
+			return errkind.New(errkind.KindInvalidSchema, "orm: upsert requires primary key or unique constraint")
+		}
+		insertSQL, err := s.db.dialect.RenderInsert(table.Name, cols, returningColumns(table))
+		if err != nil {
+			return err
+		}
+		set := upsertSetClauses(table, values, conflict, s.db.dialect)
+		sqlText := strings.TrimSuffix(insertSQL, ";") + " ON CONFLICT (" + strings.Join(quoteColumns(conflict, s.db.dialect), ", ") + ") DO UPDATE SET " + strings.Join(set, ", ") + ";"
+		return s.db.execReturning(ctx, sqlText, args, model, table)
+	})
 }
 
 func (s *Session) Tx(fn func(*Session) error) error {
@@ -240,26 +317,105 @@ func (s *Session) Tx(fn func(*Session) error) error {
 }
 
 func (db *DB) Tx(ctx context.Context, fn func(*Session) error) error {
-	if db.tx != nil {
-		return fn(&Session{db: db, ctx: ctx})
+	return db.traceOperation(ctx, "db.transaction", []Attribute{{Key: "orm.operation", Value: "transaction"}}, func(ctx context.Context) error {
+		if db.tx != nil {
+			return fn(&Session{db: db, ctx: ctx})
+		}
+		if db.db == nil {
+			return errkind.New(errkind.KindConfiguration, "orm: nil db")
+		}
+		tx, err := db.db.BeginTx(ctx, nil)
+		if err != nil {
+			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: begin transaction", err)
+		}
+		child := *db
+		child.tx = tx
+		child.db = nil
+		child.stmts = map[string]*sql.Stmt{}
+		s := &Session{db: &child, ctx: ctx}
+		if err := fn(s); err != nil {
+			rollbackErr := db.traceOperation(ctx, "db.rollback", []Attribute{{Key: "orm.operation", Value: "rollback"}}, func(context.Context) error {
+				return tx.Rollback()
+			})
+			if rollbackErr != nil {
+				return rollbackErr
+			}
+			return err
+		}
+		if err := db.traceOperation(ctx, "db.commit", []Attribute{{Key: "orm.operation", Value: "commit"}}, func(context.Context) error {
+			return tx.Commit()
+		}); err != nil {
+			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: commit transaction", err)
+		}
+		return nil
+	})
+}
+
+func (db *DB) SQLDB() *sql.DB {
+	if db == nil {
+		return nil
 	}
-	if db.db == nil {
-		return fmt.Errorf("orm: nil db")
+	return db.db
+}
+
+func (db *DB) Dialect() dialect.Dialect {
+	if db == nil {
+		return nil
 	}
-	tx, err := db.db.BeginTx(ctx, nil)
-	if err != nil {
-		return err
+	return db.dialect
+}
+
+func (db *DB) PingContext(ctx context.Context) error {
+	return db.traceOperation(ctx, "db.ping", []Attribute{{Key: "orm.operation", Value: "ping"}}, func(ctx context.Context) error {
+		if db == nil {
+			return errkind.New(errkind.KindConfiguration, "orm: nil db")
+		}
+		if db.tx != nil {
+			return nil
+		}
+		if db.db == nil {
+			return errkind.New(errkind.KindConfiguration, "orm: nil db")
+		}
+		if err := db.db.PingContext(ctx); err != nil {
+			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: ping", err)
+		}
+		return nil
+	})
+}
+
+func (db *DB) Ping(ctx context.Context) error {
+	return db.PingContext(ctx)
+}
+
+func (db *DB) Stats() sql.DBStats {
+	if db == nil || db.db == nil {
+		return sql.DBStats{}
 	}
-	child := *db
-	child.tx = tx
-	child.db = nil
-	child.stmts = map[string]*sql.Stmt{}
-	s := &Session{db: &child, ctx: ctx}
-	if err := fn(s); err != nil {
-		_ = tx.Rollback()
-		return err
-	}
-	return tx.Commit()
+	return db.db.Stats()
+}
+
+func (db *DB) Close() error {
+	return db.traceOperation(context.Background(), "db.close", []Attribute{{Key: "orm.operation", Value: "close"}}, func(context.Context) error {
+		if db == nil {
+			return nil
+		}
+		db.stmtMu.Lock()
+		for _, stmt := range db.stmts {
+			_ = stmt.Close()
+		}
+		db.stmts = map[string]*sql.Stmt{}
+		db.stmtMu.Unlock()
+		if db.tx != nil {
+			return nil
+		}
+		if db.db == nil {
+			return nil
+		}
+		if err := db.db.Close(); err != nil {
+			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: close", err)
+		}
+		return nil
+	})
 }
 
 type QueryOption func(*queryState)
@@ -308,6 +464,7 @@ func (s *Session) buildState(dest any, opts ...QueryOption) (*queryState, error)
 	if err != nil {
 		return nil, err
 	}
+	s.db.logPolicyOverride(s.ctx)
 	state := &queryState{table: meta.table, columns: columnsForTable(meta.table)}
 	if s.withDeleted {
 		state.withDeleted = true
@@ -315,7 +472,7 @@ func (s *Session) buildState(dest any, opts ...QueryOption) (*queryState, error)
 	for _, opt := range opts {
 		opt(state)
 	}
-	if !state.withDeleted && softDeleteColumn(meta.table) != nil {
+	if !state.withDeleted && access.PolicyFromContext(s.ctx).EnforcesSoftDelete() && softDeleteColumn(meta.table) != nil {
 		state.where = append(state.where, predicate{expr: softDeleteColumn(meta.table).Name + " IS NULL"})
 	}
 	preds, _, err := s.db.access.Apply(s.ctx, meta.table, access.OpQuery, nil)
@@ -332,34 +489,34 @@ func (db *DB) buildSelectSQL(ctx context.Context, state *queryState) (string, []
 	var clauses []string
 	var args []any
 	for _, p := range state.where {
-		clause, clauseArgs := bindClause(p.expr, p.args, len(args)+1)
+		clause, clauseArgs := bindClause(p.expr, p.args, len(args)+1, db.dialect)
 		clauses = append(clauses, clause)
 		args = append(args, clauseArgs...)
 	}
 	sqlText, err := db.dialect.RenderSelect(state.table.Name, quoteColumns(state.columns, db.dialect), clauses, state.orderBy, state.limit, state.offset)
 	if err != nil {
-		return "", nil, err
+		return "", nil, errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render select", err)
 	}
 	return sqlText, args, nil
 }
 
 func (db *DB) resolveDest(dest any) (*tableMeta, error) {
 	if dest == nil {
-		return nil, fmt.Errorf("orm: nil destination")
+		return nil, errkind.New(errkind.KindConfiguration, "orm: nil destination")
 	}
 	rt := reflect.TypeOf(dest)
 	for rt.Kind() == reflect.Pointer {
 		rt = rt.Elem()
 	}
 	if rt.Kind() != reflect.Slice {
-		return nil, fmt.Errorf("orm: destination must be pointer to slice")
+		return nil, errkind.New(errkind.KindInvalidSchema, "orm: destination must be pointer to slice")
 	}
 	elem := rt.Elem()
 	if elem.Kind() == reflect.Pointer {
 		elem = elem.Elem()
 	}
 	if elem.Kind() != reflect.Struct {
-		return nil, fmt.Errorf("orm: slice element must be struct")
+		return nil, errkind.New(errkind.KindInvalidSchema, "orm: slice element must be struct")
 	}
 	table := db.lookupTableForType(elem)
 	return &tableMeta{table: table, typ: elem}, nil
@@ -371,76 +528,54 @@ type tableMeta struct {
 }
 
 func (db *DB) lookupTableForType(t reflect.Type) *schema.Table {
+	if cached, ok := tableMetaCache.Load(t); ok {
+		if table, ok := cached.(*schema.Table); ok {
+			return table
+		}
+	}
 	if db.schema != nil {
 		for _, table := range db.schema.Tables {
 			if table == nil {
 				continue
 			}
 			if table.GoTypeName == t.Name() {
+				tableMetaCache.Store(t, table)
 				return table
 			}
 		}
 	}
-	return &schema.Table{
+	table := &schema.Table{
 		Name:        schema.Pluralize(schema.ToSnakeCase(t.Name())),
 		GoTypeName:  t.Name(),
 		PackageName: t.PkgPath(),
 		Columns:     columnsFromType(t),
 	}
+	tableMetaCache.Store(t, table)
+	return table
 }
 
 func (db *DB) resolveModel(model any) (*tableMeta, reflect.Value, error) {
 	rv := reflect.ValueOf(model)
 	if rv.Kind() != reflect.Pointer || rv.IsNil() {
-		return nil, reflect.Value{}, fmt.Errorf("orm: model must be non-nil pointer")
+		return nil, reflect.Value{}, errkind.New(errkind.KindConfiguration, "orm: model must be non-nil pointer")
 	}
 	elem := rv.Elem()
 	if elem.Kind() != reflect.Struct {
-		return nil, reflect.Value{}, fmt.Errorf("orm: model must point to struct")
+		return nil, reflect.Value{}, errkind.New(errkind.KindConfiguration, "orm: model must point to struct")
 	}
 	return &tableMeta{table: db.lookupTableForType(elem.Type()), typ: elem.Type()}, elem, nil
 }
 
 func columnsFromType(t reflect.Type) []*schema.Column {
-	var cols []*schema.Column
-	for i := 0; i < t.NumField(); i++ {
-		f := t.Field(i)
-		if !f.IsExported() {
-			continue
-		}
-		col := &schema.Column{
-			Name:   schema.ToSnakeCase(f.Name),
-			GoName: f.Name,
-			Type:   reflectTypeToSchemaType(f.Type),
-		}
-		if f.Name == "ID" {
-			col.PrimaryKey = true
-			col.Unique = true
-		}
-		switch f.Name {
-		case "CreatedAt":
-			col.CreatedAt = true
-		case "UpdatedAt":
-			col.UpdatedAt = true
-		case "DeletedAt":
-			col.DeletedAt = true
-			col.Nullable = true
-			col.SoftDelete = true
-		case "CreatedBy":
-			col.CreatedBy = true
-		case "UpdatedBy":
-			col.UpdatedBy = true
-		case "DeletedBy":
-			col.DeletedBy = true
-		}
-		cols = append(cols, col)
-	}
-	return cols
+	return schema.ColumnsFromType(t)
 }
 
 func reflectTypeToSchemaType(t reflect.Type) schema.Type {
 	for t.Kind() == reflect.Pointer {
 		t = t.Elem()
+	}
+	if typ, ok := schema.ResolveCustomType(t); ok {
+		return typ
 	}
 	switch t.Kind() {
 	case reflect.Bool:
@@ -474,7 +609,7 @@ func reflectTypeToSchemaType(t reflect.Type) schema.Type {
 func scanIntoSlice(rows *sql.Rows, dest any, table *schema.Table) error {
 	rv := reflect.ValueOf(dest)
 	if rv.Kind() != reflect.Pointer || rv.Elem().Kind() != reflect.Slice {
-		return fmt.Errorf("orm: destination must be pointer to slice")
+		return errkind.New(errkind.KindInvalidSchema, "orm: destination must be pointer to slice")
 	}
 	slice := rv.Elem()
 	elemType := slice.Type().Elem()
@@ -485,9 +620,9 @@ func scanIntoSlice(rows *sql.Rows, dest any, table *schema.Table) error {
 	}
 	cols, err := rows.Columns()
 	if err != nil {
-		return err
+		return errkind.Wrap(errkind.KindRuntimeQuery, "orm: rows columns", err)
 	}
-	fieldMap := structFieldMap(elemType)
+	fieldMap := structFieldIndexMap(elemType)
 	for rows.Next() {
 		holder := make([]any, len(cols))
 		for i := range holder {
@@ -495,12 +630,16 @@ func scanIntoSlice(rows *sql.Rows, dest any, table *schema.Table) error {
 			holder[i] = &value
 		}
 		if err := rows.Scan(holder...); err != nil {
-			return err
+			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: scan row", err)
 		}
 		item := reflect.New(elemType).Elem()
 		for i, col := range cols {
-			f, ok := fieldMap[strings.ToLower(col)]
-			if !ok || !f.CanSet() {
+			idx, ok := fieldMap[strings.ToLower(schema.ToSnakeCase(col))]
+			if !ok {
+				continue
+			}
+			f := item.FieldByIndex(idx)
+			if !f.CanSet() {
 				continue
 			}
 			if valuePtr, ok := holder[i].(*any); ok {
@@ -514,18 +653,23 @@ func scanIntoSlice(rows *sql.Rows, dest any, table *schema.Table) error {
 		}
 	}
 	rv.Elem().Set(slice)
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return errkind.Wrap(errkind.KindRuntimeQuery, "orm: scan rows", err)
+	}
+	return nil
 }
 
-func structFieldMap(t reflect.Type) map[string]reflect.Value {
-	out := map[string]reflect.Value{}
-	v := reflect.New(t).Elem()
+func structFieldIndexMap(t reflect.Type) map[string][]int {
+	if fieldMap := schema.StructFieldIndexMap(t); fieldMap != nil {
+		return fieldMap
+	}
+	out := map[string][]int{}
 	for i := 0; i < t.NumField(); i++ {
 		f := t.Field(i)
 		if !f.IsExported() {
 			continue
 		}
-		out[strings.ToLower(schema.ToSnakeCase(f.Name))] = v.Field(i)
+		out[strings.ToLower(schema.ToSnakeCase(f.Name))] = []int{i}
 	}
 	return out
 }
@@ -534,6 +678,12 @@ func assignReflectValue(dst reflect.Value, value any) {
 	if !dst.CanSet() || value == nil {
 		return
 	}
+	if dst.CanAddr() {
+		if scanner, ok := dst.Addr().Interface().(sql.Scanner); ok {
+			_ = scanner.Scan(value)
+			return
+		}
+	}
 	v := reflect.ValueOf(value)
 	if v.Type().AssignableTo(dst.Type()) {
 		dst.Set(v)
@@ -541,6 +691,11 @@ func assignReflectValue(dst reflect.Value, value any) {
 	}
 	if dst.Kind() == reflect.Pointer {
 		elem := reflect.New(dst.Type().Elem())
+		if scanner, ok := elem.Interface().(sql.Scanner); ok {
+			_ = scanner.Scan(value)
+			dst.Set(elem)
+			return
+		}
 		assignReflectValue(elem.Elem(), value)
 		dst.Set(elem)
 		return
@@ -599,7 +754,6 @@ func setFloat(dst reflect.Value, value any) {
 }
 
 func populateAuditAndScope(ctx context.Context, table *schema.Table, rv reflect.Value, values map[string]any, now time.Time, op access.Operation) error {
-	ac, _ := access.FromContext(ctx)
 	preds, writes, err := access.NewEngine().Apply(ctx, table, op, nil)
 	_ = preds
 	if err != nil {
@@ -610,6 +764,9 @@ func populateAuditAndScope(ctx context.Context, table *schema.Table, rv reflect.
 		setFieldByColumn(rv, table, w.Field, w.Value)
 	}
 	for _, col := range table.Columns {
+		if !access.PolicyFromContext(ctx).EnforcesAudit() {
+			continue
+		}
 		switch {
 		case col.CreatedAt && op == access.OpInsert:
 			values[col.Name] = now
@@ -622,11 +779,13 @@ func populateAuditAndScope(ctx context.Context, table *schema.Table, rv reflect.
 			setFieldByColumn(rv, table, col.Name, now)
 		}
 	}
-	_ = ac
 	return nil
 }
 
-func applyStructFieldValues(table *schema.Table, rv reflect.Value, values map[string]any, now time.Time, isInsert bool) error {
+func applyStructFieldValues(ctx context.Context, table *schema.Table, rv reflect.Value, values map[string]any, now time.Time, isInsert bool) error {
+	if !access.PolicyFromContext(ctx).EnforcesAudit() {
+		return nil
+	}
 	for _, col := range table.Columns {
 		if _, ok := values[col.Name]; ok {
 			continue
@@ -686,7 +845,7 @@ func returningColumns(table *schema.Table) []string {
 	return cols
 }
 
-func updateSetClauses(table *schema.Table, values map[string]any, pkCols []string) ([]string, []any) {
+func updateSetClauses(table *schema.Table, values map[string]any, pkCols []string, d dialect.Dialect) ([]string, []any) {
 	pk := map[string]struct{}{}
 	for _, name := range pkCols {
 		pk[name] = struct{}{}
@@ -702,14 +861,14 @@ func updateSetClauses(table *schema.Table, values map[string]any, pkCols []strin
 		if !ok {
 			continue
 		}
-		set = append(set, fmt.Sprintf("%s = %s", quoteIdent(col.Name), placeholder(argIndex)))
+		set = append(set, fmt.Sprintf("%s = %s", d.QuoteIdent(col.Name), d.Placeholder(argIndex)))
 		args = append(args, v)
 		argIndex++
 	}
 	return set, args
 }
 
-func upsertSetClauses(table *schema.Table, values map[string]any, conflict []string) []string {
+func upsertSetClauses(table *schema.Table, values map[string]any, conflict []string, d dialect.Dialect) []string {
 	conflictSet := map[string]struct{}{}
 	for _, name := range conflict {
 		conflictSet[name] = struct{}{}
@@ -722,7 +881,7 @@ func upsertSetClauses(table *schema.Table, values map[string]any, conflict []str
 		if _, ok := values[col.Name]; !ok {
 			continue
 		}
-		set = append(set, fmt.Sprintf("%s = EXCLUDED.%s", quoteIdent(col.Name), quoteIdent(col.Name)))
+		set = append(set, fmt.Sprintf("%s = EXCLUDED.%s", d.QuoteIdent(col.Name), d.QuoteIdent(col.Name)))
 	}
 	return set
 }
@@ -737,16 +896,19 @@ func conflictColumns(table *schema.Table) []string {
 	return cols
 }
 
-func buildWhereClauses(cols []string, args []any, extra []predicate) ([]string, []any) {
+func buildWhereClauses(cols []string, args []any, extra []predicate, d dialect.Dialect) ([]string, []any) {
 	var where []string
 	whereArgs := append([]any(nil), args...)
+	argIndex := len(whereArgs) + 1
 	for _, col := range cols {
-		where = append(where, quoteIdent(col)+" = "+placeholder(len(whereArgs)+1))
+		where = append(where, d.QuoteIdent(col)+" = "+d.Placeholder(argIndex))
+		argIndex++
 	}
 	for _, p := range extra {
-		clause, clauseArgs := bindClause(p.expr, p.args, len(whereArgs)+1)
+		clause, clauseArgs := bindClause(p.expr, p.args, argIndex, d)
 		where = append(where, clause)
 		whereArgs = append(whereArgs, clauseArgs...)
+		argIndex += len(clauseArgs)
 	}
 	return where, whereArgs
 }
@@ -766,21 +928,32 @@ func softDeleteColumn(table *schema.Table) *schema.Column {
 
 func (s *Session) softDelete(model any, table *schema.Table, rv reflect.Value, soft *schema.Column) error {
 	now := time.Now().UTC()
-	values := map[string]any{soft.Name: now}
+	values := map[string]any{}
+	if err := populateAuditAndScope(s.ctx, table, rv, values, now, access.OpDelete); err != nil {
+		return err
+	}
+	values[soft.Name] = now
 	setFieldByColumn(rv, table, soft.Name, now)
 	pkCols, pkArgs, err := primaryKeyValues(table, rv)
 	if err != nil {
 		return err
 	}
-	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(s.ctx, table))
-	set := []string{quoteIdent(soft.Name) + " = " + placeholder(1)}
+	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(s.ctx, table), s.db.dialect)
+	set, args := updateSetClauses(table, values, pkCols, s.db.dialect)
+	if len(set) == 0 {
+		set = []string{s.db.dialect.QuoteIdent(soft.Name) + " = " + s.db.dialect.Placeholder(1)}
+		args = []any{now}
+	}
 	sqlText, err := s.db.dialect.RenderUpdate(table.Name, set, whereSQL, nil)
 	if err != nil {
-		return err
+		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render soft delete", err)
 	}
-	_, err = s.db.execContext(s.ctx, sqlText, append([]any{now}, whereArgs...)...)
+	_, err = s.db.execContext(s.ctx, sqlText, append(args, whereArgs...)...)
 	_ = values
-	return err
+	if err != nil {
+		return errkind.Wrap(errkind.KindRuntimeQuery, "orm: soft delete", err)
+	}
+	return nil
 }
 
 func primaryKeyValues(table *schema.Table, rv reflect.Value) ([]string, []any, error) {
@@ -792,7 +965,7 @@ func primaryKeyValues(table *schema.Table, rv reflect.Value) ([]string, []any, e
 		}
 		field := fieldByColumn(rv, table, col.Name)
 		if !field.IsValid() {
-			return nil, nil, fmt.Errorf("orm: missing primary key field %s", col.Name)
+			return nil, nil, errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: missing primary key field %s", col.Name))
 		}
 		cols = append(cols, col.Name)
 		args = append(args, field.Interface())
@@ -804,11 +977,9 @@ func fieldByColumn(rv reflect.Value, table *schema.Table, col string) reflect.Va
 	if rv.Kind() == reflect.Pointer {
 		rv = rv.Elem()
 	}
-	for i := 0; i < rv.NumField(); i++ {
-		f := rv.Type().Field(i)
-		if schema.ToSnakeCase(f.Name) == col {
-			return rv.Field(i)
-		}
+	indexMap := structFieldIndexMap(rv.Type())
+	if idx, ok := indexMap[strings.ToLower(schema.ToSnakeCase(col))]; ok {
+		return rv.FieldByIndex(idx)
 	}
 	return reflect.Value{}
 }
@@ -840,7 +1011,7 @@ func columnsForTable(table *schema.Table) []string {
 	return cols
 }
 
-func bindClause(expr string, args []any, start int) (string, []any) {
+func bindClause(expr string, args []any, start int, d dialect.Dialect) (string, []any) {
 	if expr == "" {
 		return "", nil
 	}
@@ -851,22 +1022,13 @@ func bindClause(expr string, args []any, start int) (string, []any) {
 	next := start
 	for _, r := range expr {
 		if r == '?' {
-			b.WriteString("$")
-			b.WriteString(fmt.Sprint(next))
+			b.WriteString(d.Placeholder(next))
 			next++
 			continue
 		}
 		b.WriteRune(r)
 	}
 	return b.String(), append([]any(nil), args...)
-}
-
-func placeholder(i int) string {
-	return "$" + fmt.Sprint(i)
-}
-
-func quoteIdent(name string) string {
-	return `"` + strings.ReplaceAll(name, `"`, `""`) + `"`
 }
 
 func isZeroValue(v any) bool {
@@ -883,29 +1045,109 @@ func isZeroValue(v any) bool {
 }
 
 func (db *DB) execContext(ctx context.Context, sqlText string, args ...any) (sql.Result, error) {
+	start := time.Now()
 	if db.tx != nil {
-		return db.tx.ExecContext(ctx, sqlText, args...)
+		res, err := db.tx.ExecContext(ctx, sqlText, args...)
+		if err != nil {
+			wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: exec", err)
+			db.recordExecMetrics(ctx, time.Since(start), wrapped, -1)
+			db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
+			return nil, wrapped
+		}
+		rowsAffected := int64(-1)
+		if res != nil {
+			if count, countErr := res.RowsAffected(); countErr == nil {
+				rowsAffected = count
+			}
+		}
+		duration := time.Since(start)
+		db.recordExecMetrics(ctx, duration, nil, rowsAffected)
+		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, AffectedRows: rowsAffected, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
+		return res, nil
 	}
 	if db.db == nil {
-		return nil, fmt.Errorf("orm: nil db")
+		return nil, errkind.New(errkind.KindConfiguration, "orm: nil db")
 	}
 	if stmt, ok := db.prepared(sqlText); ok {
-		return stmt.ExecContext(ctx, args...)
+		res, err := stmt.ExecContext(ctx, args...)
+		if err != nil {
+			wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: exec", err)
+			db.recordExecMetrics(ctx, time.Since(start), wrapped, -1)
+			db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
+			return nil, wrapped
+		}
+		rowsAffected := int64(-1)
+		if res != nil {
+			if count, countErr := res.RowsAffected(); countErr == nil {
+				rowsAffected = count
+			}
+		}
+		duration := time.Since(start)
+		db.recordExecMetrics(ctx, duration, nil, rowsAffected)
+		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, AffectedRows: rowsAffected, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
+		return res, nil
 	}
-	return db.db.ExecContext(ctx, sqlText, args...)
+	res, err := db.db.ExecContext(ctx, sqlText, args...)
+	if err != nil {
+		wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: exec", err)
+		db.recordExecMetrics(ctx, time.Since(start), wrapped, -1)
+		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
+		return nil, wrapped
+	}
+	rowsAffected := int64(-1)
+	if res != nil {
+		if count, countErr := res.RowsAffected(); countErr == nil {
+			rowsAffected = count
+		}
+	}
+	duration := time.Since(start)
+	db.recordExecMetrics(ctx, duration, nil, rowsAffected)
+	db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, AffectedRows: rowsAffected, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
+	return res, nil
 }
 
 func (db *DB) queryContext(ctx context.Context, sqlText string, args ...any) (*sql.Rows, error) {
+	start := time.Now()
 	if db.tx != nil {
-		return db.tx.QueryContext(ctx, sqlText, args...)
+		rows, err := db.tx.QueryContext(ctx, sqlText, args...)
+		if err != nil {
+			wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: query", err)
+			db.recordQueryMetrics(ctx, time.Since(start), wrapped, -1)
+			db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
+			return nil, wrapped
+		}
+		duration := time.Since(start)
+		db.recordQueryMetrics(ctx, duration, nil, -1)
+		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
+		return rows, nil
 	}
 	if db.db == nil {
-		return nil, fmt.Errorf("orm: nil db")
+		return nil, errkind.New(errkind.KindConfiguration, "orm: nil db")
 	}
 	if stmt, ok := db.prepared(sqlText); ok {
-		return stmt.QueryContext(ctx, args...)
+		rows, err := stmt.QueryContext(ctx, args...)
+		if err != nil {
+			wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: query", err)
+			db.recordQueryMetrics(ctx, time.Since(start), wrapped, -1)
+			db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
+			return nil, wrapped
+		}
+		duration := time.Since(start)
+		db.recordQueryMetrics(ctx, duration, nil, -1)
+		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
+		return rows, nil
 	}
-	return db.db.QueryContext(ctx, sqlText, args...)
+	rows, err := db.db.QueryContext(ctx, sqlText, args...)
+	if err != nil {
+		wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: query", err)
+		db.recordQueryMetrics(ctx, time.Since(start), wrapped, -1)
+		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
+		return nil, wrapped
+	}
+	duration := time.Since(start)
+	db.recordQueryMetrics(ctx, duration, nil, -1)
+	db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
+	return rows, nil
 }
 
 func (db *DB) execReturning(ctx context.Context, sqlText string, args []any, model any, table *schema.Table) error {
@@ -917,7 +1159,7 @@ func (db *DB) execReturning(ctx context.Context, sqlText string, args []any, mod
 	if rows.Next() {
 		cols, err := rows.Columns()
 		if err != nil {
-			return err
+			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: rows columns", err)
 		}
 		holder := make([]any, len(cols))
 		for i := range holder {
@@ -925,7 +1167,7 @@ func (db *DB) execReturning(ctx context.Context, sqlText string, args []any, mod
 			holder[i] = &value
 		}
 		if err := rows.Scan(holder...); err != nil {
-			return err
+			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: scan returning row", err)
 		}
 		rv := reflect.ValueOf(model)
 		if rv.Kind() == reflect.Pointer && !rv.IsNil() {
@@ -936,7 +1178,21 @@ func (db *DB) execReturning(ctx context.Context, sqlText string, args []any, mod
 			}
 		}
 	}
-	return rows.Err()
+	if err := rows.Err(); err != nil {
+		return errkind.Wrap(errkind.KindRuntimeQuery, "orm: returning rows", err)
+	}
+	return nil
+}
+
+func (db *DB) logPolicyOverride(ctx context.Context) {
+	if db == nil || db.logger == nil {
+		return
+	}
+	policy := access.PolicyFromContext(ctx)
+	if policy.IsDefault() {
+		return
+	}
+	db.logger.Printf("access policy override: %s", policy.Name())
 }
 
 func (db *DB) prepared(sqlText string) (*sql.Stmt, bool) {
