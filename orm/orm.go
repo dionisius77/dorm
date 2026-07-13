@@ -19,7 +19,7 @@ import (
 var ErrNotFound = errors.New("orm: not found")
 
 var (
-	tableMetaCache  sync.Map // map[reflect.Type]*schema.Table
+	tableMetaCache sync.Map // map[reflect.Type]*schema.Table
 )
 
 type Logger interface {
@@ -148,6 +148,62 @@ func (s *Session) FindOne(dest any, opts ...QueryOption) error {
 		return ErrNotFound
 	}
 	return nil
+}
+
+// Count returns the number of rows matching the model type and query options.
+func (s *Session) Count(model any, opts ...QueryOption) (int64, error) {
+	var count int64
+	err := s.db.traceOperation(s.ctx, "db.query", []Attribute{{Key: "orm.operation", Value: "count"}}, func(ctx context.Context) error {
+		s.db.logPolicyOverride(ctx)
+		meta, _, err := s.db.resolveModel(model)
+		if err != nil {
+			return err
+		}
+		state := &queryState{table: meta.table}
+		if s.withDeleted {
+			state.withDeleted = true
+		}
+		for _, opt := range opts {
+			opt(state)
+		}
+		if !state.withDeleted && access.PolicyFromContext(s.ctx).EnforcesSoftDelete() && softDeleteColumn(meta.table) != nil {
+			state.where = append(state.where, predicate{expr: softDeleteColumn(meta.table).Name + " IS NULL"})
+		}
+		preds, _, err := s.db.access.Apply(s.ctx, meta.table, access.OpQuery, nil)
+		if err != nil {
+			return err
+		}
+		for _, pred := range preds {
+			state.where = append(state.where, predicate{expr: pred.SQL, args: pred.Args})
+		}
+		var clauses []string
+		var args []any
+		for _, p := range state.where {
+			clause, clauseArgs := bindClause(p.expr, p.args, len(args)+1, s.db.dialect)
+			clauses = append(clauses, clause)
+			args = append(args, clauseArgs...)
+		}
+		sqlText, err := s.db.dialect.RenderSelect(meta.table.Name, []string{"COUNT(*)"}, clauses, nil, nil, nil)
+		if err != nil {
+			return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render count", err)
+		}
+		rows, err := s.db.queryContext(ctx, sqlText, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		if !rows.Next() {
+			return nil
+		}
+		if err := rows.Scan(&count); err != nil {
+			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: scan count", err)
+		}
+		return rows.Err()
+	})
+	if err != nil {
+		return 0, err
+	}
+	return count, nil
 }
 
 func (s *Session) Create(model any) error {
