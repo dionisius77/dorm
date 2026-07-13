@@ -29,10 +29,12 @@ package models
 
 import (
 	"time"
+
+	"github.com/google/uuid"
 )
 
 type User struct {
-	ID        string    `orm:"pk"`
+	ID        uuid.UUID `orm:"pk"`
 	Email     string    `orm:"unique"`
 	CompanyID string    `orm:"company"`
 	CreatedAt time.Time `orm:"created_at"`
@@ -145,4 +147,3 @@ go test ./...
 ## License
 
 This project is licensed under the [MIT License](LICENSE).
-
