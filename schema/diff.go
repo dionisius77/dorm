@@ -139,15 +139,7 @@ func columnsEqual(a, b *Column) bool {
 		a.Unique == b.Unique &&
 		a.Identity == b.Identity &&
 		a.Default == b.Default &&
-		a.Generated == b.Generated &&
-		a.SoftDelete == b.SoftDelete &&
-		a.CreatedAt == b.CreatedAt &&
-		a.UpdatedAt == b.UpdatedAt &&
-		a.DeletedAt == b.DeletedAt &&
-		a.CreatedBy == b.CreatedBy &&
-		a.UpdatedBy == b.UpdatedBy &&
-		a.DeletedBy == b.DeletedBy &&
-		a.Scope == b.Scope
+		a.Generated == b.Generated
 }
 
 func indexesEqual(a, b *Index) bool {
