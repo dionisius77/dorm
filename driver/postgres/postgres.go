@@ -22,21 +22,25 @@ const defaultDriverName = "postgres"
 var registeredDrivers sync.Map
 
 type Config struct {
-	DSN             string
-	DriverName      string
-	Host            string
-	Port            int
-	Database        string
-	Username        string
-	Password        string
-	SSLMode         string
-	Timezone        string
-	SearchPath      string
-	Options         map[string]string
-	MaxOpenConns    int
-	MaxIdleConns    int
-	ConnMaxLifetime time.Duration
-	ConnMaxIdleTime time.Duration
+	DSN              string
+	DriverName       string
+	Host             string
+	Port             int
+	Database         string
+	Username         string
+	Password         string
+	SSLMode          string
+	Timezone         string
+	SearchPath       string
+	PreflightEnabled bool
+	ModelRoot        string
+	SnapshotPath     string
+	SchemaName       string
+	Options          map[string]string
+	MaxOpenConns     int
+	MaxIdleConns     int
+	ConnMaxLifetime  time.Duration
+	ConnMaxIdleTime  time.Duration
 }
 
 type Driver struct {
@@ -45,6 +49,7 @@ type Driver struct {
 }
 
 var _ driver.Driver = (*Driver)(nil)
+var _ driver.PreflightProvider = (*Driver)(nil)
 
 func New(cfg Config) *Driver {
 	cfg = normalizeConfig(cfg)
@@ -72,6 +77,9 @@ func normalizeConfig(cfg Config) Config {
 	}
 	if cfg.SearchPath == "" {
 		cfg.SearchPath = "public"
+	}
+	if cfg.SchemaName == "" {
+		cfg.SchemaName = "public"
 	}
 	if cfg.MaxOpenConns == 0 {
 		cfg.MaxOpenConns = 25
@@ -116,6 +124,18 @@ func (d *Driver) Dialect() dialect.Dialect {
 		d.dialect = pgdialect.New()
 	}
 	return d.dialect
+}
+
+func (d *Driver) PreflightConfig() driver.PreflightConfig {
+	if d == nil {
+		return driver.PreflightConfig{}
+	}
+	return driver.PreflightConfig{
+		Enabled:      d.cfg.PreflightEnabled,
+		Root:         d.cfg.ModelRoot,
+		SnapshotPath: d.cfg.SnapshotPath,
+		SchemaName:   d.cfg.SchemaName,
+	}
 }
 
 func (d *Driver) Open(ctx context.Context) (*sql.DB, error) {

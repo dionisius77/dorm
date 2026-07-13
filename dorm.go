@@ -2,11 +2,13 @@ package dorm
 
 import (
 	"context"
+	"strings"
 	"sync"
 
 	"github.com/dionisius77/dorm/driver"
 	"github.com/dionisius77/dorm/errkind"
 	"github.com/dionisius77/dorm/orm"
+	"github.com/dionisius77/dorm/schema"
 )
 
 type DB = orm.DB
@@ -61,5 +63,31 @@ func Open(ctx context.Context, drivers ...driver.Driver) (*DB, error) {
 		_ = db.Close()
 		return nil, errkind.Wrap(errkind.KindRuntimeQuery, "dorm: ping database", err)
 	}
+	if err := runOpenPreflight(ctx, drv, db); err != nil {
+		_ = db.Close()
+		return nil, err
+	}
 	return db, nil
+}
+
+func runOpenPreflight(ctx context.Context, drv driver.Driver, db *DB) error {
+	provider, ok := drv.(driver.PreflightProvider)
+	if !ok {
+		return nil
+	}
+	cfg := provider.PreflightConfig()
+	if !cfg.Enabled {
+		return nil
+	}
+	if strings.TrimSpace(cfg.Root) == "" {
+		return errkind.New(errkind.KindConfiguration, "dorm: schema preflight requires model root")
+	}
+	report, err := schema.DetectDriftFromSource(ctx, cfg.Root, schema.PostgresInspector{}, db.SQLDB(), cfg.SchemaName, cfg.SnapshotPath)
+	if err != nil {
+		return errkind.Wrap(errkind.KindRuntimeQuery, "dorm: schema preflight", err)
+	}
+	if report != nil && !report.Clean() {
+		return errkind.New(errkind.KindInvalidSchema, "dorm: schema preflight detected drift")
+	}
+	return nil
 }
