@@ -93,7 +93,8 @@ func readPostgresColumns(ctx context.Context, db *sql.DB, schemaName string) (ma
 	defer rows.Close()
 	out := map[string][]*Column{}
 	for rows.Next() {
-		var tableName, columnName, isNullable, dataType, udtName, columnDefault string
+		var tableName, columnName, isNullable, dataType, udtName string
+		var columnDefault sql.NullString
 		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &udtName, &columnDefault); err != nil {
 			return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres columns", err)
 		}
@@ -105,7 +106,9 @@ func readPostgresColumns(ctx context.Context, db *sql.DB, schemaName string) (ma
 			Name:     columnName,
 			Type:     Type{Name: typ, Kind: typeKindFromName(typ)},
 			Nullable: strings.EqualFold(isNullable, "YES"),
-			Default:  columnDefault,
+		}
+		if columnDefault.Valid {
+			col.Default = columnDefault.String
 		}
 		out[tableName] = append(out[tableName], col)
 	}
