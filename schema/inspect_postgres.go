@@ -104,14 +104,12 @@ func readPostgresColumns(ctx context.Context, db *sql.DB, schemaName string) (ma
 		if err := rows.Scan(&tableName, &columnName, &isNullable, &dataType, &udtName, &columnDefault); err != nil {
 			return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres columns", err)
 		}
-		typ := dataType
-		if udtName != "" {
-			typ = udtName
-		}
+		typ := normalizePostgresTypeName(dataType, udtName)
+		nullable := strings.EqualFold(isNullable, "YES")
 		col := &Column{
 			Name:     columnName,
-			Type:     Type{Name: typ, Kind: typeKindFromName(typ)},
-			Nullable: strings.EqualFold(isNullable, "YES"),
+			Type:     Type{Name: typ, Kind: typeKindFromName(typ), Nullable: nullable},
+			Nullable: nullable,
 		}
 		if columnDefault.Valid {
 			col.Default = columnDefault.String
@@ -122,6 +120,59 @@ func readPostgresColumns(ctx context.Context, db *sql.DB, schemaName string) (ma
 		return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres columns", err)
 	}
 	return out, nil
+}
+
+func normalizePostgresTypeName(dataType, udtName string) string {
+	name := strings.TrimSpace(strings.ToLower(dataType))
+	switch name {
+	case "integer", "int4":
+		return "integer"
+	case "smallint", "int2":
+		return "smallint"
+	case "bigint", "int8":
+		return "bigint"
+	case "timestamp with time zone", "timestamptz":
+		return "timestamptz"
+	case "timestamp without time zone", "timestamp":
+		return "timestamp"
+	case "character varying", "varchar":
+		return "text"
+	case "character", "bpchar":
+		return "text"
+	case "boolean", "bool":
+		return "boolean"
+	case "uuid":
+		return "uuid"
+	case "text":
+		return "text"
+	}
+	name = strings.TrimSpace(strings.ToLower(udtName))
+	switch name {
+	case "int2":
+		return "smallint"
+	case "int4":
+		return "integer"
+	case "int8":
+		return "bigint"
+	case "timestamptz":
+		return "timestamptz"
+	case "timestamp":
+		return "timestamp"
+	case "varchar":
+		return "text"
+	case "bpchar":
+		return "text"
+	case "uuid":
+		return "uuid"
+	case "bool":
+		return "boolean"
+	case "text":
+		return "text"
+	}
+	if dataType != "" {
+		return strings.TrimSpace(dataType)
+	}
+	return strings.TrimSpace(udtName)
 }
 
 func readPostgresConstraints(ctx context.Context, db *sql.DB, schemaName string) (map[string][]*Constraint, map[string]struct{}, error) {
