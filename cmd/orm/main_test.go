@@ -83,6 +83,8 @@ func (c fakeConn) QueryContext(ctx context.Context, query string, args []driver.
 		return &fakeRows{cols: []string{"table_name"}}, nil
 	case strings.Contains(normalized, "information_schema.columns"):
 		return &fakeRows{cols: []string{"table_name", "column_name", "is_nullable", "data_type", "udt_name", "column_default"}}, nil
+	case strings.Contains(normalized, "from pg_constraint"):
+		return &fakeRows{cols: []string{"table_name", "conname", "contype", "index_name", "columns"}}, nil
 	case strings.Contains(normalized, "pg_indexes"):
 		return &fakeRows{cols: []string{"tablename", "indexname", "indexdef"}}, nil
 	default:

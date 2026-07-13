@@ -129,6 +129,20 @@ func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName,
 			Columns: pk,
 		})
 	}
+	for _, col := range table.Columns {
+		if col == nil || !col.Unique || col.PrimaryKey {
+			continue
+		}
+		name := "uq_" + table.Name + "_" + col.Name
+		if constraintExists(table.Constraints, name) {
+			continue
+		}
+		table.Constraints = append(table.Constraints, &Constraint{
+			Name:    name,
+			Kind:    ConstraintUnique,
+			Columns: []string{col.Name},
+		})
+	}
 	return table
 }
 
@@ -619,4 +633,13 @@ func columnByName(cols []*Column, name string) *Column {
 		}
 	}
 	return nil
+}
+
+func constraintExists(constraints []*Constraint, name string) bool {
+	for _, c := range constraints {
+		if c != nil && c.Name == name {
+			return true
+		}
+	}
+	return false
 }

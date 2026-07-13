@@ -53,6 +53,19 @@ type Product struct {
 	if idColumn == nil || !idColumn.PrimaryKey {
 		t.Fatalf("expected ID column to be primary key")
 	}
+	var uniqueConstraint *schema.Constraint
+	for _, c := range table.Constraints {
+		if c != nil && c.Kind == schema.ConstraintUnique && len(c.Columns) == 1 && c.Columns[0] == "name" {
+			uniqueConstraint = c
+			break
+		}
+	}
+	if uniqueConstraint == nil {
+		t.Fatalf("expected unique constraint for name, got %#v", table.Constraints)
+	}
+	if uniqueConstraint.Name != "uq_products_name" {
+		t.Fatalf("expected unique constraint name uq_products_name, got %s", uniqueConstraint.Name)
+	}
 }
 
 func TestBuilderParsesViews(t *testing.T) {

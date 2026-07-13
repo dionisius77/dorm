@@ -173,12 +173,14 @@ func (d Dialect) renderCreateTable(op schema.Operation) (string, error) {
 	if len(defs) == 0 {
 		return "", fmt.Errorf("postgres: create table requires columns")
 	}
-	if pk := tablePrimaryKeyColumns(op.TableDef); len(pk) > 0 {
-		var quoted []string
-		for _, col := range pk {
-			quoted = append(quoted, d.QuoteIdent(col))
+	for _, constraint := range op.TableDef.Constraints {
+		def, err := d.renderTableConstraint(constraint)
+		if err != nil {
+			return "", err
 		}
-		defs = append(defs, "PRIMARY KEY ("+strings.Join(quoted, ", ")+")")
+		if def != "" {
+			defs = append(defs, def)
+		}
 	}
 	sql := "CREATE TABLE IF NOT EXISTS " + d.QuoteIdent(table) + " (\n  " + strings.Join(defs, ",\n  ") + "\n);"
 	return sql, nil
@@ -252,42 +254,55 @@ func (d Dialect) renderCreateConstraint(op schema.Operation) (string, error) {
 	if op.Constraint == nil {
 		return "", fmt.Errorf("postgres: create constraint requires constraint")
 	}
-	switch op.Constraint.Kind {
+	def, err := d.renderTableConstraint(op.Constraint)
+	if err != nil {
+		return "", err
+	}
+	if def == "" {
+		return "", fmt.Errorf("postgres: unsupported constraint kind %q", op.Constraint.Kind)
+	}
+	return "ALTER TABLE " + d.QuoteIdent(op.Table) + " ADD CONSTRAINT " + d.QuoteIdent(op.Constraint.Name) + " " + def + ";", nil
+}
+
+func (d Dialect) renderTableConstraint(constraint *schema.Constraint) (string, error) {
+	if constraint == nil {
+		return "", nil
+	}
+	switch constraint.Kind {
 	case schema.ConstraintPrimaryKey:
 		var cols []string
-		for _, c := range op.Constraint.Columns {
+		for _, c := range constraint.Columns {
 			cols = append(cols, d.QuoteIdent(c))
 		}
-		return "ALTER TABLE " + d.QuoteIdent(op.Table) + " ADD CONSTRAINT " + d.QuoteIdent(op.Constraint.Name) + " PRIMARY KEY (" + strings.Join(cols, ", ") + ");", nil
+		return "PRIMARY KEY (" + strings.Join(cols, ", ") + ")", nil
 	case schema.ConstraintUnique:
 		var cols []string
-		for _, c := range op.Constraint.Columns {
+		for _, c := range constraint.Columns {
 			cols = append(cols, d.QuoteIdent(c))
 		}
-		return "ALTER TABLE " + d.QuoteIdent(op.Table) + " ADD CONSTRAINT " + d.QuoteIdent(op.Constraint.Name) + " UNIQUE (" + strings.Join(cols, ", ") + ");", nil
+		return "UNIQUE (" + strings.Join(cols, ", ") + ")", nil
 	case schema.ConstraintForeignKey:
 		var cols []string
-		for _, c := range op.Constraint.Columns {
+		for _, c := range constraint.Columns {
 			cols = append(cols, d.QuoteIdent(c))
 		}
 		var refCols []string
-		for _, c := range op.Constraint.ReferencedColumns {
+		for _, c := range constraint.ReferencedColumns {
 			refCols = append(refCols, d.QuoteIdent(c))
 		}
-		stmt := "ALTER TABLE " + d.QuoteIdent(op.Table) + " ADD CONSTRAINT " + d.QuoteIdent(op.Constraint.Name) +
-			" FOREIGN KEY (" + strings.Join(cols, ", ") + ") REFERENCES " + d.QuoteIdent(op.Constraint.ReferencedTable) +
+		stmt := "FOREIGN KEY (" + strings.Join(cols, ", ") + ") REFERENCES " + d.QuoteIdent(constraint.ReferencedTable) +
 			" (" + strings.Join(refCols, ", ") + ")"
-		if op.Constraint.OnDelete != "" {
-			stmt += " ON DELETE " + op.Constraint.OnDelete
+		if constraint.OnDelete != "" {
+			stmt += " ON DELETE " + constraint.OnDelete
 		}
-		if op.Constraint.OnUpdate != "" {
-			stmt += " ON UPDATE " + op.Constraint.OnUpdate
+		if constraint.OnUpdate != "" {
+			stmt += " ON UPDATE " + constraint.OnUpdate
 		}
-		return stmt + ";", nil
+		return stmt, nil
 	case schema.ConstraintCheck:
-		return "ALTER TABLE " + d.QuoteIdent(op.Table) + " ADD CONSTRAINT " + d.QuoteIdent(op.Constraint.Name) + " CHECK (" + op.Constraint.Expression + ");", nil
+		return "CHECK (" + constraint.Expression + ")", nil
 	default:
-		return "", fmt.Errorf("postgres: unsupported constraint kind %q", op.Constraint.Kind)
+		return "", fmt.Errorf("postgres: unsupported constraint kind %q", constraint.Kind)
 	}
 }
 
