@@ -78,12 +78,19 @@ func readPostgresTables(ctx context.Context, db *sql.DB, schemaName string) ([]s
 		if err := rows.Scan(&name); err != nil {
 			return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres tables", err)
 		}
+		if shouldSkipInspectorTable(name) {
+			continue
+		}
 		out = append(out, name)
 	}
 	if err := rows.Err(); err != nil {
 		return nil, errkind.Wrap(errkind.KindRuntimeQuery, "schema: read postgres tables", err)
 	}
 	return out, nil
+}
+
+func shouldSkipInspectorTable(name string) bool {
+	return strings.EqualFold(name, "orm_migrations")
 }
 
 func readPostgresColumns(ctx context.Context, db *sql.DB, schemaName string) (map[string][]*Column, error) {
