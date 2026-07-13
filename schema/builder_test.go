@@ -63,8 +63,8 @@ type Product struct {
 	if uniqueConstraint == nil {
 		t.Fatalf("expected unique constraint for name, got %#v", table.Constraints)
 	}
-	if uniqueConstraint.Name != "uq_products_name" {
-		t.Fatalf("expected unique constraint name uq_products_name, got %s", uniqueConstraint.Name)
+	if uniqueConstraint.Name != "products_name_key" {
+		t.Fatalf("expected unique constraint name products_name_key, got %s", uniqueConstraint.Name)
 	}
 }
 

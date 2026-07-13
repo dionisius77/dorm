@@ -124,7 +124,7 @@ func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName,
 	}
 	if pk := primaryKeyColumns(table.Columns); len(pk) > 0 {
 		table.Constraints = append(table.Constraints, &Constraint{
-			Name:    "pk_" + table.Name,
+			Name:    table.Name + "_pkey",
 			Kind:    ConstraintPrimaryKey,
 			Columns: pk,
 		})
@@ -133,7 +133,7 @@ func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName,
 		if col == nil || !col.Unique || col.PrimaryKey {
 			continue
 		}
-		name := "uq_" + table.Name + "_" + col.Name
+		name := table.Name + "_" + col.Name + "_key"
 		if constraintExists(table.Constraints, name) {
 			continue
 		}
