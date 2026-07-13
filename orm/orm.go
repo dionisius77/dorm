@@ -241,6 +241,15 @@ func (s *Session) Create(model any) error {
 }
 
 func (s *Session) Update(model any) error {
+	return s.update(model, nil, true)
+}
+
+// UpdateWhere updates rows matching explicit query filters.
+func (s *Session) UpdateWhere(model any, opts ...QueryOption) error {
+	return s.update(model, opts, false)
+}
+
+func (s *Session) update(model any, opts []QueryOption, usePrimaryKey bool) error {
 	return s.db.traceOperation(s.ctx, "db.update", []Attribute{{Key: "orm.operation", Value: "update"}}, func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
 		if err := invokeBeforeUpdateHook(ctx, model); err != nil {
@@ -259,15 +268,37 @@ func (s *Session) Update(model any) error {
 		if err := applyStructFieldValues(ctx, table, rv, values, now, false); err != nil {
 			return err
 		}
-		pkCols, pkArgs, err := primaryKeyValues(table, rv)
-		if err != nil {
-			return err
+		setPkCols := primaryKeyColumnNames(table)
+		set, args := updateSetClauses(table, values, setPkCols, s.db.dialect)
+		if len(set) == 0 {
+			return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: no updatable columns for %s", table.Name))
 		}
-		if len(pkCols) == 0 {
-			return errkind.New(errkind.KindInvalidSchema, "orm: update requires primary key")
+
+		var whereCols []string
+		var whereArgs []any
+		var extraPreds []predicate
+		if usePrimaryKey {
+			whereCols, whereArgs, err = primaryKeyValues(table, rv)
+			if err != nil {
+				return err
+			}
+			if len(whereCols) == 0 {
+				return errkind.New(errkind.KindInvalidSchema, "orm: update requires primary key")
+			}
+			extraPreds = append(extraPreds, accessPredicates(ctx, table)...)
+		} else {
+			state := &queryState{}
+			for _, opt := range opts {
+				opt(state)
+			}
+			if len(state.where) == 0 {
+				return errkind.New(errkind.KindInvalidSchema, "orm: updatewhere requires where clauses")
+			}
+			extraPreds = append(extraPreds, state.where...)
+			extraPreds = append(extraPreds, accessPredicates(ctx, table)...)
 		}
-		set, args := updateSetClauses(table, values, pkCols, s.db.dialect)
-		whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), s.db.dialect)
+
+		whereSQL, whereArgs := buildWhereClauses(whereCols, whereArgs, extraPreds, s.db.dialect)
 		sqlText, err := s.db.dialect.RenderUpdate(table.Name, set, whereSQL, returningColumns(table))
 		if err != nil {
 			return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render update", err)
@@ -1029,6 +1060,19 @@ func primaryKeyValues(table *schema.Table, rv reflect.Value) ([]string, []any, e
 	return cols, args, nil
 }
 
+func primaryKeyColumnNames(table *schema.Table) []string {
+	if table == nil {
+		return nil
+	}
+	var cols []string
+	for _, col := range table.Columns {
+		if col.PrimaryKey {
+			cols = append(cols, col.Name)
+		}
+	}
+	return cols
+}
+
 func fieldByColumn(rv reflect.Value, table *schema.Table, col string) reflect.Value {
 	if rv.Kind() == reflect.Pointer {
 		rv = rv.Elem()
@@ -1207,6 +1251,10 @@ func (db *DB) queryContext(ctx context.Context, sqlText string, args ...any) (*s
 }
 
 func (db *DB) execReturning(ctx context.Context, sqlText string, args []any, model any, table *schema.Table) error {
+	if !strings.Contains(strings.ToUpper(sqlText), " RETURNING ") {
+		_, err := db.execContext(ctx, sqlText, args...)
+		return err
+	}
 	rows, err := db.queryContext(ctx, sqlText, args...)
 	if err != nil {
 		return err
