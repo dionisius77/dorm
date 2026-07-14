@@ -15,6 +15,7 @@ import (
 	"github.com/dionisius77/dorm/errkind"
 	"github.com/dionisius77/dorm/migrate"
 	"github.com/dionisius77/dorm/schema"
+	"github.com/dionisius77/dorm/seed"
 )
 
 func main() {
@@ -35,6 +36,8 @@ func run(ctx context.Context, args []string) error {
 		return cmdMigrate(ctx, args[1:])
 	case "schema":
 		return cmdSchema(ctx, args[1:])
+	case "seed":
+		return cmdSeed(ctx, args[1:])
 	case "doctor":
 		return cmdDoctor(ctx, args[1:])
 	default:
@@ -43,7 +46,7 @@ func run(ctx context.Context, args []string) error {
 }
 
 func usage() error {
-	fmt.Fprintln(os.Stderr, "usage: orm <init|migrate|schema|doctor>")
+	fmt.Fprintln(os.Stderr, "usage: orm <init|migrate|schema|seed|doctor>")
 	return nil
 }
 
@@ -228,6 +231,64 @@ func cmdSchema(ctx context.Context, args []string) error {
 	default:
 		return usage()
 	}
+}
+
+func cmdSeed(ctx context.Context, args []string) error {
+	if len(args) == 0 {
+		return usage()
+	}
+	switch args[0] {
+	case "run":
+		return cmdSeedRun(ctx, args[1:])
+	case "list":
+		return cmdSeedList(args[1:])
+	case "reset":
+		return cmdSeedReset(args[1:])
+	default:
+		return usage()
+	}
+}
+
+func cmdSeedRun(ctx context.Context, args []string) error {
+	fs := flag.NewFlagSet("seed run", flag.ContinueOnError)
+	root := fs.String("root", ".", "project root")
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	cfg, err := loadConfig(filepath.Join(*root, defaultConfig().ConfigFile))
+	if err != nil {
+		return err
+	}
+	db, err := openConfiguredDB(ctx, cfg)
+	if err != nil {
+		return err
+	}
+	defer db.Close()
+	if err := db.PingContext(ctx); err != nil {
+		return err
+	}
+	return seed.Run(ctx, db)
+}
+
+func cmdSeedList(args []string) error {
+	fs := flag.NewFlagSet("seed list", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	for _, name := range seed.List() {
+		fmt.Fprintln(os.Stdout, name)
+	}
+	return nil
+}
+
+func cmdSeedReset(args []string) error {
+	fs := flag.NewFlagSet("seed reset", flag.ContinueOnError)
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+	seed.Reset()
+	fmt.Fprintln(os.Stdout, "seed registry cleared")
+	return nil
 }
 
 func cmdSchemaCheck(ctx context.Context, args []string) error {

@@ -30,6 +30,7 @@ type Config struct {
 	DB                  *sql.DB
 	Tx                  *sql.Tx
 	Dialect             dialect.Dialect
+	DriverName          string
 	Schema              *schema.Schema
 	Logger              Logger
 	Observability       ObservabilityConfig
@@ -42,6 +43,7 @@ type DB struct {
 	db                  *sql.DB
 	tx                  *sql.Tx
 	dialect             dialect.Dialect
+	driverName          string
 	schema              *schema.Schema
 	logger              Logger
 	observability       ObservabilityConfig
@@ -68,6 +70,7 @@ func New(cfg Config) *DB {
 		db:                  cfg.DB,
 		tx:                  cfg.Tx,
 		dialect:             cfg.Dialect,
+		driverName:          cfg.DriverName,
 		schema:              cfg.Schema,
 		logger:              cfg.Logger,
 		observability:       obs,
@@ -1146,107 +1149,180 @@ func isZeroValue(v any) bool {
 
 func (db *DB) execContext(ctx context.Context, sqlText string, args ...any) (sql.Result, error) {
 	start := time.Now()
-	if db.tx != nil {
-		res, err := db.tx.ExecContext(ctx, sqlText, args...)
-		if err != nil {
-			wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: exec", err)
-			db.recordExecMetrics(ctx, time.Since(start), wrapped, -1)
-			db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
-			return nil, wrapped
+	entry := SQLLogEntry{
+		SQL:        sqlText,
+		Args:       append([]any(nil), args...),
+		Timestamp:  start,
+		Visibility: db.observability.TraceSQL,
+		Driver:     db.driverName,
+		Dialect:    db.dialectName(),
+		Operation:  "exec",
+	}
+	if db.observability.MaskParameters && db.observability.TraceSQL == TraceSQLStatementWithArgs {
+		entry.Args = maskSQLArgs(db.observability, entry.Args)
+	}
+	var result sql.Result
+	err := db.traceWithSpan(ctx, "db.sql.exec", sqlTraceVisibilityAttrs(entry, db), func(ctx context.Context, span Span) error {
+		if db.tx != nil {
+			res, execErr := db.tx.ExecContext(ctx, sqlText, args...)
+			if execErr != nil {
+				wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: exec", execErr)
+				duration := time.Since(start)
+				entry.Duration = duration
+				entry.Err = wrapped
+				entry.Slow = isSlowQuery(duration, db.observability.SlowQueryThreshold)
+				db.recordExecMetrics(ctx, duration, wrapped, -1)
+				if span != nil {
+					span.SetAttributes(sqlTraceVisibilityAttrs(entry, db)...)
+				}
+				db.logSQL(ctx, entry)
+				return wrapped
+			}
+			result = res
+		} else {
+			if db.db == nil {
+				return errkind.New(errkind.KindConfiguration, "orm: nil db")
+			}
+			if stmt, ok := db.prepared(sqlText); ok {
+				res, execErr := stmt.ExecContext(ctx, args...)
+				if execErr != nil {
+					wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: exec", execErr)
+					duration := time.Since(start)
+					entry.Duration = duration
+					entry.Err = wrapped
+					entry.Slow = isSlowQuery(duration, db.observability.SlowQueryThreshold)
+					db.recordExecMetrics(ctx, duration, wrapped, -1)
+					if span != nil {
+						span.SetAttributes(sqlTraceVisibilityAttrs(entry, db)...)
+					}
+					db.logSQL(ctx, entry)
+					return wrapped
+				}
+				result = res
+			} else {
+				res, execErr := db.db.ExecContext(ctx, sqlText, args...)
+				if execErr != nil {
+					wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: exec", execErr)
+					duration := time.Since(start)
+					entry.Duration = duration
+					entry.Err = wrapped
+					entry.Slow = isSlowQuery(duration, db.observability.SlowQueryThreshold)
+					db.recordExecMetrics(ctx, duration, wrapped, -1)
+					if span != nil {
+						span.SetAttributes(sqlTraceVisibilityAttrs(entry, db)...)
+					}
+					db.logSQL(ctx, entry)
+					return wrapped
+				}
+				result = res
+			}
 		}
 		rowsAffected := int64(-1)
-		if res != nil {
-			if count, countErr := res.RowsAffected(); countErr == nil {
+		if result != nil {
+			if count, countErr := result.RowsAffected(); countErr == nil {
 				rowsAffected = count
 			}
 		}
 		duration := time.Since(start)
+		entry.Duration = duration
+		entry.AffectedRows = rowsAffected
+		entry.Slow = isSlowQuery(duration, db.observability.SlowQueryThreshold)
 		db.recordExecMetrics(ctx, duration, nil, rowsAffected)
-		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, AffectedRows: rowsAffected, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
-		return res, nil
-	}
-	if db.db == nil {
-		return nil, errkind.New(errkind.KindConfiguration, "orm: nil db")
-	}
-	if stmt, ok := db.prepared(sqlText); ok {
-		res, err := stmt.ExecContext(ctx, args...)
-		if err != nil {
-			wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: exec", err)
-			db.recordExecMetrics(ctx, time.Since(start), wrapped, -1)
-			db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
-			return nil, wrapped
+		if span != nil {
+			span.SetAttributes(sqlTraceVisibilityAttrs(entry, db)...)
 		}
-		rowsAffected := int64(-1)
-		if res != nil {
-			if count, countErr := res.RowsAffected(); countErr == nil {
-				rowsAffected = count
-			}
-		}
-		duration := time.Since(start)
-		db.recordExecMetrics(ctx, duration, nil, rowsAffected)
-		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, AffectedRows: rowsAffected, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
-		return res, nil
-	}
-	res, err := db.db.ExecContext(ctx, sqlText, args...)
+		db.logSQL(ctx, entry)
+		return nil
+	})
 	if err != nil {
-		wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: exec", err)
-		db.recordExecMetrics(ctx, time.Since(start), wrapped, -1)
-		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
-		return nil, wrapped
+		return nil, err
 	}
-	rowsAffected := int64(-1)
-	if res != nil {
-		if count, countErr := res.RowsAffected(); countErr == nil {
-			rowsAffected = count
-		}
-	}
-	duration := time.Since(start)
-	db.recordExecMetrics(ctx, duration, nil, rowsAffected)
-	db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, AffectedRows: rowsAffected, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
-	return res, nil
+	return result, nil
 }
 
 func (db *DB) queryContext(ctx context.Context, sqlText string, args ...any) (*sql.Rows, error) {
 	start := time.Now()
-	if db.tx != nil {
-		rows, err := db.tx.QueryContext(ctx, sqlText, args...)
-		if err != nil {
-			wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: query", err)
-			db.recordQueryMetrics(ctx, time.Since(start), wrapped, -1)
-			db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
-			return nil, wrapped
+	entry := SQLLogEntry{
+		SQL:        sqlText,
+		Args:       append([]any(nil), args...),
+		Timestamp:  start,
+		Visibility: db.observability.TraceSQL,
+		Driver:     db.driverName,
+		Dialect:    db.dialectName(),
+		Operation:  "query",
+	}
+	if db.observability.MaskParameters && db.observability.TraceSQL == TraceSQLStatementWithArgs {
+		entry.Args = maskSQLArgs(db.observability, entry.Args)
+	}
+	var rows *sql.Rows
+	err := db.traceWithSpan(ctx, "db.sql.query", sqlTraceVisibilityAttrs(entry, db), func(ctx context.Context, span Span) error {
+		if db.tx != nil {
+			res, queryErr := db.tx.QueryContext(ctx, sqlText, args...)
+			if queryErr != nil {
+				wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: query", queryErr)
+				duration := time.Since(start)
+				entry.Duration = duration
+				entry.Err = wrapped
+				entry.Slow = isSlowQuery(duration, db.observability.SlowQueryThreshold)
+				db.recordQueryMetrics(ctx, duration, wrapped, -1)
+				if span != nil {
+					span.SetAttributes(sqlTraceVisibilityAttrs(entry, db)...)
+				}
+				db.logSQL(ctx, entry)
+				return wrapped
+			}
+			rows = res
+		} else {
+			if db.db == nil {
+				return errkind.New(errkind.KindConfiguration, "orm: nil db")
+			}
+			if stmt, ok := db.prepared(sqlText); ok {
+				res, queryErr := stmt.QueryContext(ctx, args...)
+				if queryErr != nil {
+					wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: query", queryErr)
+					duration := time.Since(start)
+					entry.Duration = duration
+					entry.Err = wrapped
+					entry.Slow = isSlowQuery(duration, db.observability.SlowQueryThreshold)
+					db.recordQueryMetrics(ctx, duration, wrapped, -1)
+					if span != nil {
+						span.SetAttributes(sqlTraceVisibilityAttrs(entry, db)...)
+					}
+					db.logSQL(ctx, entry)
+					return wrapped
+				}
+				rows = res
+			} else {
+				res, queryErr := db.db.QueryContext(ctx, sqlText, args...)
+				if queryErr != nil {
+					wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: query", queryErr)
+					duration := time.Since(start)
+					entry.Duration = duration
+					entry.Err = wrapped
+					entry.Slow = isSlowQuery(duration, db.observability.SlowQueryThreshold)
+					db.recordQueryMetrics(ctx, duration, wrapped, -1)
+					if span != nil {
+						span.SetAttributes(sqlTraceVisibilityAttrs(entry, db)...)
+					}
+					db.logSQL(ctx, entry)
+					return wrapped
+				}
+				rows = res
+			}
 		}
 		duration := time.Since(start)
+		entry.Duration = duration
+		entry.Slow = isSlowQuery(duration, db.observability.SlowQueryThreshold)
 		db.recordQueryMetrics(ctx, duration, nil, -1)
-		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
-		return rows, nil
-	}
-	if db.db == nil {
-		return nil, errkind.New(errkind.KindConfiguration, "orm: nil db")
-	}
-	if stmt, ok := db.prepared(sqlText); ok {
-		rows, err := stmt.QueryContext(ctx, args...)
-		if err != nil {
-			wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: query", err)
-			db.recordQueryMetrics(ctx, time.Since(start), wrapped, -1)
-			db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
-			return nil, wrapped
+		if span != nil {
+			span.SetAttributes(sqlTraceVisibilityAttrs(entry, db)...)
 		}
-		duration := time.Since(start)
-		db.recordQueryMetrics(ctx, duration, nil, -1)
-		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
-		return rows, nil
-	}
-	rows, err := db.db.QueryContext(ctx, sqlText, args...)
+		db.logSQL(ctx, entry)
+		return nil
+	})
 	if err != nil {
-		wrapped := errkind.Wrap(errkind.KindRuntimeQuery, "orm: query", err)
-		db.recordQueryMetrics(ctx, time.Since(start), wrapped, -1)
-		db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: time.Since(start), Err: wrapped, Slow: isSlowQuery(time.Since(start), db.observability.SlowQueryThreshold)})
-		return nil, wrapped
+		return nil, err
 	}
-	duration := time.Since(start)
-	db.recordQueryMetrics(ctx, duration, nil, -1)
-	db.logSQL(ctx, SQLLogEntry{SQL: sqlText, Args: args, Duration: duration, Slow: isSlowQuery(duration, db.observability.SlowQueryThreshold)})
 	return rows, nil
 }
 

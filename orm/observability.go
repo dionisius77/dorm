@@ -9,7 +9,17 @@ import (
 	"github.com/dionisius77/dorm/errkind"
 )
 
-// SQLLogMode controls how SQL statements are reported.
+// TraceSQLMode controls how much SQL detail is exposed through traces.
+type TraceSQLMode string
+
+const (
+	TraceSQLDisabled          TraceSQLMode = "disabled"
+	TraceSQLMetadata          TraceSQLMode = "metadata"
+	TraceSQLStatement         TraceSQLMode = "statement"
+	TraceSQLStatementWithArgs TraceSQLMode = "statement_with_args"
+)
+
+// SQLLogMode controls how SQL statements are reported by the legacy logger path.
 type SQLLogMode string
 
 const (
@@ -20,10 +30,11 @@ const (
 	SQLLogTrace      SQLLogMode = "trace"
 )
 
-// ObservabilityConfig configures tracing, metrics, and SQL logging.
+// ObservabilityConfig configures tracing, metrics, and SQL visibility.
 type ObservabilityConfig struct {
 	Tracing            bool
 	Metrics            bool
+	TraceSQL           TraceSQLMode
 	SQLLogging         SQLLogMode
 	SlowQueryThreshold time.Duration
 	MaskParameters     bool
@@ -32,6 +43,9 @@ type ObservabilityConfig struct {
 	TracerProvider     TracerProvider
 	MeterProvider      MeterProvider
 }
+
+// Observability is an alias kept for the public API documented in ADR-026.
+type Observability = ObservabilityConfig
 
 // SQLLogEntry captures a single SQL log event.
 type SQLLogEntry struct {
@@ -42,6 +56,11 @@ type SQLLogEntry struct {
 	Timestamp    time.Time
 	Err          error
 	Slow         bool
+	Visibility   TraceSQLMode
+	Driver       string
+	Dialect      string
+	Operation    string
+	Table        string
 }
 
 // ObservabilityLogger receives SQL logs and error events.
@@ -106,12 +125,18 @@ type Histogram interface {
 // DefaultObservabilityConfig returns the default observability configuration.
 func DefaultObservabilityConfig() ObservabilityConfig {
 	return ObservabilityConfig{
+		TraceSQL:   TraceSQLMetadata,
 		SQLLogging: SQLLogDisabled,
 	}
 }
 
 // Validate checks that the configuration is internally consistent.
 func (c ObservabilityConfig) Validate() error {
+	switch c.TraceSQL {
+	case TraceSQLDisabled, TraceSQLMetadata, TraceSQLStatement, TraceSQLStatementWithArgs, "":
+	default:
+		return errkind.New(errkind.KindConfiguration, fmt.Sprintf("orm: invalid sql trace mode %q", c.TraceSQL))
+	}
 	switch c.SQLLogging {
 	case SQLLogDisabled, SQLLogErrorsOnly, SQLLogSlow, SQLLogDebug, SQLLogTrace, "":
 	default:
@@ -125,12 +150,15 @@ func (c ObservabilityConfig) Validate() error {
 
 // Enabled reports whether any observability feature is active.
 func (c ObservabilityConfig) Enabled() bool {
-	return c.Tracing || c.Metrics || c.SQLLogging != SQLLogDisabled || c.Logger != nil
+	return c.Tracing || c.Metrics || (c.Tracing && c.TraceSQL != TraceSQLDisabled) || c.SQLLogging != SQLLogDisabled || c.Logger != nil
 }
 
 // Normalized returns a copy with defaults applied.
 func (c ObservabilityConfig) Normalized() ObservabilityConfig {
 	out := c
+	if out.TraceSQL == "" {
+		out.TraceSQL = TraceSQLMetadata
+	}
 	if out.SQLLogging == "" {
 		out.SQLLogging = SQLLogDisabled
 	}

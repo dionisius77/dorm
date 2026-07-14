@@ -28,3 +28,5 @@ This directory contains the architectural contract for the ORM.
 - [ADR-022: Connection Layer & Driver Architecture](./ADR-022-connection-layer-driver-architecture.md)
 - [ADR-023: Access Policy & Security Boundaries](./ADR-023-access-policy-security-boundaries.md)
 - [ADR-024: Composable Model Traits](./ADR-024-composable-model-traits.md)
+- [ADR-025: Seeding & Data Initialization](./ADR-025-seeding-data-initialization.md)
+- [ADR-026: SQL Observability & Trace Visibility](./ADR-026-sql-observability-trace-visibility.md)

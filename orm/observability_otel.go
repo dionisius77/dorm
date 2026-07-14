@@ -2,6 +2,7 @@ package orm
 
 import (
 	"context"
+	"database/sql"
 	"fmt"
 	"time"
 
@@ -15,13 +16,20 @@ import (
 const otelInstrumentationName = "github.com/dionisius77/dorm"
 
 func (db *DB) traceOperation(ctx context.Context, spanName string, attrs []Attribute, fn func(context.Context) error) error {
-	if db == nil || !db.observability.Tracing {
+	return db.traceWithSpan(ctx, spanName, attrs, func(ctx context.Context, _ Span) error {
 		return fn(ctx)
+	})
+}
+
+func (db *DB) traceWithSpan(ctx context.Context, spanName string, attrs []Attribute, fn func(context.Context, Span) error) error {
+	if db == nil || !db.observability.Tracing {
+		return fn(ctx, nil)
 	}
+	attrs = append(baseSpanAttributes(db), attrs...)
 	if db.observability.TracerProvider != nil {
 		ctx, span := db.observability.TracerProvider.Tracer(otelInstrumentationName).Start(ctx, spanName)
 		ensureSpanAttrs(span, attrs)
-		err := fn(ctx)
+		err := fn(ctx, span)
 		setSpanError(span, err)
 		if err != nil && db.observability.Logger != nil {
 			db.observability.Logger.LogError(ctx, err)
@@ -33,13 +41,52 @@ func (db *DB) traceOperation(ctx context.Context, spanName string, attrs []Attri
 	if len(attrs) > 0 {
 		span.SetAttributes(toOTELAttributes(attrs)...)
 	}
-	err := fn(ctx)
+	wrapped := otelSpanAdapter{span: span}
+	err := fn(ctx, wrapped)
 	setOTELSpanError(span, err)
 	if err != nil && db.observability.Logger != nil {
 		db.observability.Logger.LogError(ctx, err)
 	}
 	span.End()
 	return err
+}
+
+func baseSpanAttributes(db *DB) []Attribute {
+	if db == nil {
+		return nil
+	}
+	attrs := []Attribute{}
+	system := db.systemName()
+	if system != "" {
+		attrs = append(attrs, Attribute{Key: "db.system", Value: system})
+	}
+	if db.driverName != "" {
+		attrs = append(attrs, Attribute{Key: "orm.driver", Value: db.driverName})
+	}
+	if db.dialect != nil {
+		attrs = append(attrs, Attribute{Key: "orm.dialect", Value: db.dialect.Name()})
+	}
+	return attrs
+}
+
+func (db *DB) systemName() string {
+	if db == nil {
+		return ""
+	}
+	if db.driverName != "" {
+		return db.driverName
+	}
+	if db.dialect != nil {
+		return db.dialect.Name()
+	}
+	return ""
+}
+
+func (db *DB) dialectName() string {
+	if db == nil || db.dialect == nil {
+		return ""
+	}
+	return db.dialect.Name()
 }
 
 func (db *DB) metricProvider() Meter {
@@ -116,6 +163,11 @@ func maskSQLArgs(cfg ObservabilityConfig, args []any) []any {
 
 func maskSQLValue(cfg ObservabilityConfig, value any) any {
 	switch v := value.(type) {
+	case sql.NamedArg:
+		if cfg.ShouldMask(v.Name) {
+			return sql.Named(v.Name, "***")
+		}
+		return v
 	case string:
 		if cfg.ShouldMask(v) {
 			return "***"
@@ -161,8 +213,69 @@ func setOTELSpanError(span oteltrace.Span, err error) {
 	span.SetStatus(otelcodes.Error, err.Error())
 }
 
+type otelSpanAdapter struct {
+	span oteltrace.Span
+}
+
+func (s otelSpanAdapter) End() {
+	if s.span != nil {
+		s.span.End()
+	}
+}
+
+func (s otelSpanAdapter) RecordError(err error) {
+	if s.span != nil && err != nil {
+		s.span.RecordError(err)
+	}
+}
+
+func (s otelSpanAdapter) SetAttributes(attrs ...Attribute) {
+	if s.span == nil || len(attrs) == 0 {
+		return
+	}
+	s.span.SetAttributes(toOTELAttributes(attrs)...)
+}
+
 func isSlowQuery(duration time.Duration, threshold time.Duration) bool {
 	return threshold > 0 && duration >= threshold
+}
+
+func sqlTraceVisibilityAttrs(entry SQLLogEntry, db *DB) []Attribute {
+	attrs := []Attribute{}
+	if entry.Operation != "" {
+		attrs = append(attrs, Attribute{Key: "db.operation", Value: entry.Operation})
+		attrs = append(attrs, Attribute{Key: "orm.operation", Value: entry.Operation})
+	}
+	if entry.Table != "" {
+		attrs = append(attrs, Attribute{Key: "orm.table", Value: entry.Table})
+	}
+	if entry.Visibility != "" {
+		attrs = append(attrs, Attribute{Key: "orm.sql.visibility", Value: entry.Visibility})
+	}
+	if entry.Duration > 0 {
+		attrs = append(attrs, Attribute{Key: "orm.duration", Value: entry.Duration.Seconds()})
+	}
+	if entry.AffectedRows >= 0 {
+		attrs = append(attrs, Attribute{Key: "orm.rows", Value: entry.AffectedRows})
+	}
+	if entry.Err != nil {
+		attrs = append(attrs, Attribute{Key: "error", Value: entry.Err.Error()})
+	}
+	switch db.observability.TraceSQL {
+	case TraceSQLStatement:
+		if entry.SQL != "" {
+			attrs = append(attrs, Attribute{Key: "db.statement", Value: entry.SQL})
+		}
+	case TraceSQLStatementWithArgs:
+		if entry.SQL != "" {
+			attrs = append(attrs, Attribute{Key: "db.statement", Value: entry.SQL})
+		}
+		if len(entry.Args) > 0 {
+			attrs = append(attrs, Attribute{Key: "db.statement.args", Value: fmt.Sprint(entry.Args)})
+		}
+	case TraceSQLMetadata, TraceSQLDisabled, "":
+	}
+	return attrs
 }
 
 type otelMeter struct {

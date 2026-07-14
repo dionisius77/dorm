@@ -56,8 +56,9 @@ func Open(ctx context.Context, drivers ...driver.Driver) (*DB, error) {
 		return nil, errkind.New(errkind.KindConfiguration, "dorm: driver returned nil db")
 	}
 	db := orm.New(orm.Config{
-		DB:      sqlDB,
-		Dialect: drv.Dialect(),
+		DB:         sqlDB,
+		Dialect:    drv.Dialect(),
+		DriverName: drv.Name(),
 	})
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()
