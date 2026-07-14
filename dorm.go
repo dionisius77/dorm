@@ -13,6 +13,18 @@ import (
 
 type DB = orm.DB
 
+type OpenOption func(*openConfig)
+
+type openConfig struct {
+	observability orm.ObservabilityConfig
+}
+
+func WithObservability(cfg orm.ObservabilityConfig) OpenOption {
+	return func(o *openConfig) {
+		o.observability = cfg
+	}
+}
+
 var (
 	registeredDriverMu sync.RWMutex
 	registeredDriver   driver.Driver
@@ -33,17 +45,18 @@ func RegisteredDriver() driver.Driver {
 	return registeredDriver
 }
 
-func Open(ctx context.Context, drivers ...driver.Driver) (*DB, error) {
-	var drv driver.Driver
-	switch len(drivers) {
-	case 0:
+func Open(ctx context.Context, drv driver.Driver, opts ...OpenOption) (*DB, error) {
+	if drv == nil {
 		drv = RegisteredDriver()
-	default:
-		drv = drivers[0]
-		RegisterDriver(drv)
 	}
 	if drv == nil {
 		return nil, errkind.New(errkind.KindConfiguration, "dorm: no driver registered")
+	}
+	cfg := openConfig{}
+	for _, opt := range opts {
+		if opt != nil {
+			opt(&cfg)
+		}
 	}
 	if err := drv.Validate(); err != nil {
 		return nil, errkind.Wrap(errkind.KindConfiguration, "dorm: validate driver", err)
@@ -56,9 +69,10 @@ func Open(ctx context.Context, drivers ...driver.Driver) (*DB, error) {
 		return nil, errkind.New(errkind.KindConfiguration, "dorm: driver returned nil db")
 	}
 	db := orm.New(orm.Config{
-		DB:         sqlDB,
-		Dialect:    drv.Dialect(),
-		DriverName: drv.Name(),
+		DB:            sqlDB,
+		Dialect:       drv.Dialect(),
+		DriverName:    drv.Name(),
+		Observability: cfg.observability,
 	})
 	if err := db.PingContext(ctx); err != nil {
 		_ = db.Close()

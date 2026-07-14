@@ -15,6 +15,7 @@ import (
 	"github.com/dionisius77/dorm/dialect"
 	pgdialect "github.com/dionisius77/dorm/dialect/postgres"
 	dormdriver "github.com/dionisius77/dorm/driver"
+	"github.com/dionisius77/dorm/orm"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -45,6 +46,18 @@ type openTestRows struct {
 }
 
 type openTestResult struct{}
+
+type openTestTracerProvider struct {
+	spans int
+}
+
+type openTestTracer struct {
+	provider *openTestTracerProvider
+}
+
+type openTestSpan struct {
+	provider *openTestTracerProvider
+}
 
 func init() {
 	registerOpenTestSQLDriver()
@@ -123,6 +136,23 @@ func (c *openTestConn) CheckNamedValue(*sqldriver.NamedValue) error { return nil
 func (openTestResult) LastInsertId() (int64, error) { return 0, nil }
 
 func (openTestResult) RowsAffected() (int64, error) { return 1, nil }
+
+func (p *openTestTracerProvider) Tracer(string) orm.Tracer {
+	return openTestTracer{provider: p}
+}
+
+func (t openTestTracer) Start(ctx context.Context, name string, _ ...orm.SpanOption) (context.Context, orm.Span) {
+	_ = ctx
+	_ = name
+	t.provider.spans++
+	return ctx, openTestSpan{provider: t.provider}
+}
+
+func (s openTestSpan) End() {}
+
+func (s openTestSpan) RecordError(error) {}
+
+func (s openTestSpan) SetAttributes(...orm.Attribute) {}
 
 func (r *openTestRows) Columns() []string { return append([]string(nil), r.cols...) }
 
@@ -322,5 +352,36 @@ func TestOpenFailsOnPreflightDriftAndClosesDB(t *testing.T) {
 	defer state.mu.Unlock()
 	if state.closed == 0 {
 		t.Fatal("expected db close on preflight failure")
+	}
+}
+
+func TestOpenAppliesObservabilityConfig(t *testing.T) {
+	scenario := "observability"
+	state := openTestStateFor(scenario)
+	state.mu.Lock()
+	state.closed = 0
+	state.queries = nil
+	state.mu.Unlock()
+
+	provider := &openTestTracerProvider{}
+	db, err := Open(context.Background(), testOpenDriver{
+		scenario: scenario,
+	}, WithObservability(orm.ObservabilityConfig{
+		Tracing:        true,
+		TraceSQL:       orm.TraceSQLStatement,
+		TracerProvider: provider,
+		SQLLogging:     orm.SQLLogDisabled,
+		MaskParameters: false,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+
+	if err := db.PingContext(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if provider.spans == 0 {
+		t.Fatal("expected observability tracer to be used")
 	}
 }
