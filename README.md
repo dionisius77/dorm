@@ -89,7 +89,9 @@ Rather than supporting every SQL dialect from day one, `dorm` focuses on deliver
 Model-driven migration generation.
 
 ```bash
-go run ./cmd/dorm migrate generate
+go install github.com/dionisius77/dorm/cmd/orm
+
+orm migrate generate
 ```
 
 No automatic schema mutation.
@@ -97,7 +99,7 @@ No automatic schema mutation.
 Developers review generated migrations before execution.
 
 ```bash
-go run ./cmd/dorm migrate run
+orm migrate run
 ```
 
 If no schema changes exist, no migration is generated.
@@ -299,25 +301,25 @@ Policy changes are explicit and observable.
 Generate:
 
 ```bash
-go run ./cmd/dorm migrate generate
+orm migrate generate
 ```
 
 Run:
 
 ```bash
-go run ./cmd/dorm migrate run
+orm migrate run
 ```
 
 Rollback:
 
 ```bash
-go run ./cmd/dorm migrate rollback
+orm migrate rollback
 ```
 
 Schema verification:
 
 ```bash
-go run ./cmd/dorm schema check
+orm schema check
 ```
 
 ---
@@ -337,7 +339,7 @@ seed.Register(
 Run:
 
 ```bash
-go run ./cmd/dorm seed run
+orm seed run
 ```
 
 ---
@@ -363,17 +365,19 @@ SQL trace visibility is configurable depending on the environment.
 All database tooling is included.
 
 ```bash
-go run ./cmd/dorm --help
+go install github.com/dionisius77/dorm/cmd/orm
 
-go run ./cmd/dorm migrate generate
+orm --help
 
-go run ./cmd/dorm migrate run
+orm migrate generate
 
-go run ./cmd/dorm migrate rollback
+orm migrate run
 
-go run ./cmd/dorm schema check
+orm migrate rollback
 
-go run ./cmd/dorm seed run
+orm schema check
+
+orm seed run
 ```
 
 The CLI reuses the same Driver configuration as the application, ensuring a single source of truth for database access.
