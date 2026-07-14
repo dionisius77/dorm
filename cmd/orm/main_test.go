@@ -169,10 +169,10 @@ func TestMigrateStatusReportsAppliedAndPending(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(out, "applied:") || !strings.Contains(out, "- 0001_schema") {
+	if !strings.Contains(out, "Applied:") || !strings.Contains(out, "- 0001_schema") {
 		t.Fatalf("expected applied migration in output, got %q", out)
 	}
-	if !strings.Contains(out, "pending:") || !strings.Contains(out, "- 0002_schema") {
+	if !strings.Contains(out, "Pending:") || !strings.Contains(out, "- 0002_schema") {
 		t.Fatalf("expected pending migration in output, got %q", out)
 	}
 }
@@ -180,7 +180,15 @@ func TestMigrateStatusReportsAppliedAndPending(t *testing.T) {
 func TestSchemaCheckDetectsDrift(t *testing.T) {
 	root := t.TempDir()
 	modelsDir := filepath.Join(root, "models")
+	migrationsDir := filepath.Join(root, "migrations")
+	schemasDir := filepath.Join(root, "schemas")
 	if err := os.MkdirAll(modelsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(migrationsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(schemasDir, 0o755); err != nil {
 		t.Fatal(err)
 	}
 	modelSource := []byte(`package models
@@ -213,10 +221,10 @@ type Widget struct {
 	if err == nil {
 		t.Fatal("expected schema drift error")
 	}
-	if !strings.Contains(err.Error(), "schema drift detected") {
+	if !strings.Contains(err.Error(), "run `dorm migrate generate` and `dorm migrate run` to reconcile") {
 		t.Fatalf("unexpected error: %v", err)
 	}
-	if !strings.Contains(out, "Schema Drift Detected") {
+	if !strings.Contains(out, "⚠ Schema drift detected") {
 		t.Fatalf("expected drift message, got %q", out)
 	}
 }
@@ -254,12 +262,88 @@ func TestDoctorValidatesSnapshotConnectivityAndDialect(t *testing.T) {
 		t.Fatal(err)
 	}
 	for _, want := range []string{
-		"doctor: compatibility ok",
-		"doctor: config ok",
-		"doctor: connectivity ok",
-		"doctor: snapshot ok",
-		"doctor: dialect ok",
+		"✓ Compatibility OK",
+		"✓ Config OK",
+		"✓ Connectivity OK",
+		"✓ Snapshot OK",
+		"✓ Dialect OK",
 	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in output, got %q", want, out)
+		}
+	}
+}
+
+func TestMigrateGenerateSkipsNoopMigration(t *testing.T) {
+	root := t.TempDir()
+	modelsDir := filepath.Join(root, "models")
+	migrationsDir := filepath.Join(root, "migrations")
+	schemasDir := filepath.Join(root, "schemas")
+	if err := os.MkdirAll(modelsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(migrationsDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(schemasDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	modelSource := []byte(`package models
+
+type User struct {
+	ID   int
+	Name string
+}
+`)
+	if err := os.WriteFile(filepath.Join(modelsDir, "user.go"), modelSource, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := schema.NewBuilder(modelsDir).Build(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := schema.SaveSnapshot(filepath.Join(schemasDir, "current.snapshot.json"), &schema.Snapshot{Schema: s}); err != nil {
+		t.Fatal(err)
+	}
+	if err := saveConfig(filepath.Join(root, "orm.json"), cliConfig{
+		Root:          root,
+		ModelsDir:     "models",
+		MigrationsDir: "migrations",
+		SchemasDir:    "schemas",
+		SnapshotPath:  filepath.Join("schemas", "current.snapshot.json"),
+		SchemaName:    "public",
+		Driver:        "postgres",
+		DSN:           "generate",
+		ConfigFile:    "orm.json",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureStdout(func() error {
+		return cmdMigrateGenerate(context.Background(), []string{"--root", root})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out, "✓ No schema changes detected.") {
+		t.Fatalf("expected no-op message, got %q", out)
+	}
+	files, err := filepath.Glob(filepath.Join(migrationsDir, "*.sql"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(files) != 0 {
+		t.Fatalf("expected no migration files, got %v", files)
+	}
+}
+
+func TestRootHelpPrintsUsage(t *testing.T) {
+	out, err := captureStdout(func() error {
+		return run(context.Background(), []string{"--help"})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Usage:", "migrate", "schema", "seed", "doctor"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected %q in output, got %q", want, out)
 		}
