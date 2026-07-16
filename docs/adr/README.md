@@ -34,3 +34,4 @@ This directory contains the architectural contract for the ORM.
 - [ADR-028: Transaction API & Transaction Lifecycle](./ADR-028-transaction-api.md)
 - [ADR-029: Lifecycle Hooks](./ADR-029-lifecycle-hooks.md)
 - [ADR-030: Batch Operations](./ADR-030-batch-operations.md)
+- [ADR-031: Query Analyzer](./ADR-031-query-analyzer.md)

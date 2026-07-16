@@ -378,6 +378,8 @@ orm migrate rollback
 orm schema check
 
 orm seed run
+
+orm analyze --sql "SELECT * FROM users WHERE email = $1"
 ```
 
 The CLI reuses the same Driver configuration as the application, ensuring a single source of truth for database access.

@@ -343,7 +343,7 @@ func TestRootHelpPrintsUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Usage:", "migrate", "schema", "seed", "doctor"} {
+	for _, want := range []string{"Usage:", "migrate", "schema", "seed", "analyze", "doctor"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected %q in output, got %q", want, out)
 		}

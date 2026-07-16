@@ -12,6 +12,7 @@ import (
 	"strings"
 
 	"github.com/dionisius77/dorm"
+	"github.com/dionisius77/dorm/analyzer"
 	"github.com/dionisius77/dorm/dialect/postgres"
 	driverpostgres "github.com/dionisius77/dorm/driver/postgres"
 	"github.com/dionisius77/dorm/errkind"
@@ -44,6 +45,8 @@ func run(ctx context.Context, args []string) error {
 		return cmdSchema(ctx, args[1:])
 	case "seed":
 		return cmdSeed(ctx, args[1:])
+	case "analyze":
+		return cmdAnalyze(ctx, args[1:])
 	case "doctor":
 		return cmdDoctor(ctx, args[1:])
 	default:
@@ -563,6 +566,19 @@ func validateProjectPaths(root string, cfg cliConfig, requireModels bool) error 
 	return nil
 }
 
+func validateModelProjectPaths(root string, cfg cliConfig) error {
+	if strings.TrimSpace(root) == "" {
+		return errkind.New(errkind.KindConfiguration, "project root is required")
+	}
+	if strings.TrimSpace(cfg.ModelsDir) == "" {
+		return errkind.New(errkind.KindConfiguration, "models_dir is missing from orm.json; run `dorm init`")
+	}
+	if _, err := os.Stat(filepath.Join(root, cfg.ModelsDir)); err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, fmt.Sprintf("missing model directory %q; run `dorm init` or create it manually", cfg.ModelsDir), err)
+	}
+	return nil
+}
+
 func handleFlagError(fs *flag.FlagSet, err error) error {
 	if err == nil || err == flag.ErrHelp {
 		return nil
@@ -584,6 +600,7 @@ func printRootHelp(w io.Writer) {
 	fmt.Fprintln(w, "  migrate   Generate, run, rollback, or inspect migrations")
 	fmt.Fprintln(w, "  schema    Check schema drift against source")
 	fmt.Fprintln(w, "  seed      Run, list, or reset registered seeders")
+	fmt.Fprintln(w, "  analyze   Analyze SQL and suggest query improvements")
 	fmt.Fprintln(w, "  doctor    Validate project and database readiness")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Examples:")
@@ -591,6 +608,54 @@ func printRootHelp(w io.Writer) {
 	fmt.Fprintln(w, "  dorm migrate generate --root .")
 	fmt.Fprintln(w, "  dorm schema check --root .")
 	fmt.Fprintln(w, "  dorm seed run --root .")
+	fmt.Fprintln(w, "  dorm analyze --root . --sql \"SELECT * FROM users WHERE email = $1\"")
+}
+
+func cmdAnalyze(ctx context.Context, args []string) error {
+	fs := newFlagSet("analyze")
+	root := fs.String("root", ".", "project root")
+	sqlText := fs.String("sql", "", "SQL statement to analyze")
+	sqlFile := fs.String("sql-file", "", "file containing SQL to analyze")
+	tableName := fs.String("table", "", "table name to analyze")
+	offsetThreshold := fs.Int("offset-threshold", analyzer.DefaultLargeOffsetThreshold, "large OFFSET threshold")
+	fs.Usage = func() { printAnalyzeHelp(os.Stdout) }
+	if err := fs.Parse(args); err != nil {
+		return handleFlagError(fs, err)
+	}
+	if strings.TrimSpace(*sqlText) == "" && strings.TrimSpace(*sqlFile) == "" {
+		return errkind.New(errkind.KindConfiguration, "analyze requires --sql or --sql-file")
+	}
+	cfg, err := loadConfig(filepath.Join(*root, defaultConfig().ConfigFile))
+	if err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "analyze: load config", err)
+	}
+	if err := validateModelProjectPaths(*root, cfg); err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "analyze: validate project", err)
+	}
+	sqlInput := strings.TrimSpace(*sqlText)
+	if sqlInput == "" {
+		data, err := os.ReadFile(*sqlFile)
+		if err != nil {
+			return errkind.Wrap(errkind.KindConfiguration, "analyze: read sql file", err)
+		}
+		sqlInput = string(data)
+	}
+	schemaMeta, err := schema.NewBuilder(filepath.Join(*root, cfg.ModelsDir)).Build(ctx)
+	if err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "analyze: build schema", err)
+	}
+	report, err := analyzer.New(analyzer.Config{
+		LargeOffsetThreshold: *offsetThreshold,
+	}).Analyze(ctx, analyzer.Input{
+		SQL:    sqlInput,
+		Table:  strings.TrimSpace(*tableName),
+		Schema: schemaMeta,
+	})
+	if err != nil {
+		return errkind.Wrap(errkind.KindRuntimeQuery, "analyze: analyze sql", err)
+	}
+	fmt.Fprintln(os.Stdout, report.String())
+	return nil
 }
 
 func printInitHelp(w io.Writer) {
@@ -773,6 +838,27 @@ func printSeedResetHelp(w io.Writer) {
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Examples:")
 	fmt.Fprintln(w, "  dorm seed reset")
+}
+
+func printAnalyzeHelp(w io.Writer) {
+	fmt.Fprintln(w, "dorm analyze")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Purpose:")
+	fmt.Fprintln(w, "  Analyze generated SQL and print query-quality recommendations.")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  dorm analyze --root <path> --sql <statement>")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --root string            project root (default \".\")")
+	fmt.Fprintln(w, "  --sql string             SQL statement to analyze")
+	fmt.Fprintln(w, "  --sql-file string        file containing SQL to analyze")
+	fmt.Fprintln(w, "  --table string           table name when SQL is ambiguous")
+	fmt.Fprintln(w, "  --offset-threshold int   large OFFSET threshold (default 1000)")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Examples:")
+	fmt.Fprintln(w, "  dorm analyze --root . --sql \"SELECT * FROM users WHERE email = $1\"")
+	fmt.Fprintln(w, "  dorm analyze --root . --table users --sql-file query.sql")
 }
 
 func printDoctorHelp(w io.Writer) {

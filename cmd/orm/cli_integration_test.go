@@ -117,6 +117,33 @@ func TestCLIIntegrationCommands(t *testing.T) {
 	}
 }
 
+func TestCLIAnalyzeCommand(t *testing.T) {
+	project := itest.NewProject(t)
+	project.WriteFile(t, "models/core.go", itest.DefaultModelSource)
+	project.WriteJSON(t, "orm.json", map[string]any{
+		"root":           ".",
+		"models_dir":     "models",
+		"migrations_dir": "migrations",
+		"schemas_dir":    "schemas",
+		"snapshot_path":  "schemas/current.snapshot.json",
+		"schema_name":    project.Schema,
+		"driver":         "postgres",
+		"dsn":            project.DSN,
+		"config_file":    "orm.json",
+	})
+
+	bin := buildORMBinary(t)
+	out, code := runBinary(t, bin, "analyze", "--root", project.Root, "--sql", "SELECT * FROM products WHERE sku = $1 ORDER BY updated_at DESC OFFSET 2001")
+	if code != 0 {
+		t.Fatalf("expected exit code 0, got %d: %s", code, out)
+	}
+	for _, want := range []string{"Query analysis found", "Missing Composite Index", "Large OFFSET", "Inefficient ORDER BY"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in analyze output, got %q", want, out)
+		}
+	}
+}
+
 func buildORMBinary(t *testing.T) string {
 	t.Helper()
 	bin := filepath.Join(t.TempDir(), "orm")
