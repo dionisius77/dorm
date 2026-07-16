@@ -188,14 +188,14 @@ type Invoice struct {
 		flags func(*schema.Column) bool
 	}{
 		"company_id": {scope: schema.ScopeCompany, flags: func(c *schema.Column) bool { return c.Scope == schema.ScopeCompany }},
-		"created_at":  {flags: func(c *schema.Column) bool { return c.CreatedAt }},
-		"created_by":  {flags: func(c *schema.Column) bool { return c.CreatedBy }},
-		"updated_at":  {flags: func(c *schema.Column) bool { return c.UpdatedAt }},
-		"updated_by":  {flags: func(c *schema.Column) bool { return c.UpdatedBy }},
-		"deleted_at":  {flags: func(c *schema.Column) bool { return c.DeletedAt }},
-		"deleted_by":  {flags: func(c *schema.Column) bool { return c.DeletedBy }},
-		"number":      {},
-		"id":          {flags: func(c *schema.Column) bool { return c.PrimaryKey }},
+		"created_at": {flags: func(c *schema.Column) bool { return c.CreatedAt }},
+		"created_by": {flags: func(c *schema.Column) bool { return c.CreatedBy }},
+		"updated_at": {flags: func(c *schema.Column) bool { return c.UpdatedAt }},
+		"updated_by": {flags: func(c *schema.Column) bool { return c.UpdatedBy }},
+		"deleted_at": {flags: func(c *schema.Column) bool { return c.DeletedAt }},
+		"deleted_by": {flags: func(c *schema.Column) bool { return c.DeletedBy }},
+		"number":     {},
+		"id":         {flags: func(c *schema.Column) bool { return c.PrimaryKey }},
 	}
 	for name, check := range want {
 		var found *schema.Column
@@ -213,6 +213,59 @@ type Invoice struct {
 		}
 		if check.flags != nil && !check.flags(found) {
 			t.Fatalf("expected %s flags to be set, got %#v", name, found)
+		}
+	}
+}
+
+func TestBuilderFlattensImportedTraits(t *testing.T) {
+	dir := t.TempDir()
+	src := `package models
+
+import (
+    "github.com/dionisius77/dorm/model"
+)
+
+type Invoice struct {
+    model.Entity
+    ID string ` + "`orm:\"pk\"`" + `
+    Number string
+}
+`
+	if err := os.WriteFile(filepath.Join(dir, "invoice.go"), []byte(src), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := schema.NewBuilder(dir).Build(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(s.Tables) != 1 {
+		t.Fatalf("expected 1 table, got %d", len(s.Tables))
+	}
+	table := s.Tables[0]
+	want := map[string]func(*schema.Column) bool{
+		"company_id": func(c *schema.Column) bool { return c.Scope == schema.ScopeCompany },
+		"created_at": func(c *schema.Column) bool { return c.CreatedAt },
+		"created_by": func(c *schema.Column) bool { return c.CreatedBy },
+		"updated_at": func(c *schema.Column) bool { return c.UpdatedAt },
+		"updated_by": func(c *schema.Column) bool { return c.UpdatedBy },
+		"deleted_at": func(c *schema.Column) bool { return c.DeletedAt },
+		"deleted_by": func(c *schema.Column) bool { return c.DeletedBy },
+		"id":         func(c *schema.Column) bool { return c.PrimaryKey },
+		"number":     func(c *schema.Column) bool { return true },
+	}
+	for name, check := range want {
+		var found *schema.Column
+		for _, col := range table.Columns {
+			if col.Name == name {
+				found = col
+				break
+			}
+		}
+		if found == nil {
+			t.Fatalf("expected column %s", name)
+		}
+		if !check(found) {
+			t.Fatalf("expected %s metadata to be populated, got %#v", name, found)
 		}
 	}
 }

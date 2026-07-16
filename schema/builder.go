@@ -50,12 +50,18 @@ func (b *Builder) Build(ctx context.Context) (*Schema, error) {
 			return err
 		}
 
+		resolver, err := newStructTypeResolver(b.Root)
+		if err != nil {
+			return err
+		}
+
 		out := &Schema{Name: filepath.Base(b.Root), Version: 1}
 		for _, pkg := range pkgs {
 			structTypes := collectPackageStructTypes(pkg)
 			embeddedTypes := collectPackageEmbeddedTypeNames(pkg)
 			for _, file := range pkg.Files {
 				packageName := file.Name.Name
+				imports := collectFileImportMap(file)
 				for _, decl := range file.Decls {
 					gen, ok := decl.(*ast.GenDecl)
 					if !ok || gen.Tok != token.TYPE {
@@ -78,7 +84,7 @@ func (b *Builder) Build(ctx context.Context) (*Schema, error) {
 						if _, ok := embeddedTypes[typeSpec.Name.Name]; ok && directiveValue(doc, "table") == "" {
 							continue
 						}
-						model := buildTableFromType(typeSpec, st, packageName, doc, structTypes)
+						model := buildTableFromType(typeSpec, st, packageName, doc, structTypes, imports, resolver)
 						if model != nil {
 							out.Tables = append(out.Tables, model)
 						}
@@ -100,7 +106,7 @@ func (b *Builder) Build(ctx context.Context) (*Schema, error) {
 	return result, nil
 }
 
-func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName, doc string, structTypes map[string]*ast.StructType) *Table {
+func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName, doc string, structTypes map[string]*ast.StructType, imports map[string]string, resolver *structTypeResolver) *Table {
 	table := &Table{
 		Name:        Pluralize(ToSnakeCase(typeSpec.Name.Name)),
 		GoTypeName:  typeSpec.Name.Name,
@@ -115,7 +121,7 @@ func buildTableFromType(typeSpec *ast.TypeSpec, st *ast.StructType, packageName,
 			table.Metadata["name"] = title
 		}
 	}
-	table.Columns = append(table.Columns, buildColumnsFromStruct(typeSpec.Name.Name, st, structTypes, table, nil, map[string]bool{})...)
+	table.Columns = append(table.Columns, buildColumnsFromStruct(typeSpec.Name.Name, st, structTypes, imports, resolver, table, nil, map[string]bool{})...)
 	if !hasPrimaryKey(table) {
 		if c := columnByName(table.Columns, "id"); c != nil {
 			c.PrimaryKey = true
@@ -170,7 +176,7 @@ func buildViewFromType(typeSpec *ast.TypeSpec, packageName, doc, sqlText string)
 	return view
 }
 
-func buildColumnsFromStruct(typeName string, st *ast.StructType, structTypes map[string]*ast.StructType, table *Table, traitStack []string, seen map[string]bool) []*Column {
+func buildColumnsFromStruct(typeName string, st *ast.StructType, structTypes map[string]*ast.StructType, imports map[string]string, resolver *structTypeResolver, table *Table, traitStack []string, seen map[string]bool) []*Column {
 	if st == nil {
 		return nil
 	}
@@ -186,12 +192,12 @@ func buildColumnsFromStruct(typeName string, st *ast.StructType, structTypes map
 	var cols []*Column
 	for _, field := range st.Fields.List {
 		if len(field.Names) == 0 {
-			embedded := embeddedTypeName(field.Type)
-			if embedded == "" {
+			embedded, ok := parseEmbeddedTypeRef(field.Type)
+			if !ok {
 				continue
 			}
-			if nested, ok := structTypes[embedded]; ok {
-				cols = append(cols, buildColumnsFromStruct(embedded, nested, structTypes, table, append(traitStack, embedded), seen)...)
+			if nested, nestedStructTypes, ok := resolveEmbeddedStruct(embedded, structTypes, imports, resolver); ok {
+				cols = append(cols, buildColumnsFromStruct(embedded.Name, nested, nestedStructTypes, imports, resolver, table, append(traitStack, embedded.Name), seen)...)
 			}
 			continue
 		}
