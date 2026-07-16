@@ -28,6 +28,7 @@ const (
 	KindCommitFailed         Kind = "commit_failed"
 	KindRollbackFailed       Kind = "rollback_failed"
 	KindOptimisticLockFailed Kind = "optimistic_lock_failed"
+	KindRawSQLPolicyRequired Kind = "raw_sql_policy_required"
 
 	// Compatibility kinds retained for the existing codebase.
 	KindConfiguration        Kind = "configuration"
@@ -122,6 +123,7 @@ var (
 	ErrCommitFailed         = sentinel(KindCommitFailed)
 	ErrRollbackFailed       = sentinel(KindRollbackFailed)
 	ErrOptimisticLockFailed = sentinel(KindOptimisticLockFailed)
+	ErrRawSQLPolicyRequired = sentinel(KindRawSQLPolicyRequired)
 
 	// Compatibility sentinels used by the existing codebase.
 	ErrConfiguration        = sentinel(KindConfiguration)
@@ -323,6 +325,13 @@ type SeedError struct {
 	Conflict map[string]any
 }
 
+// RawSQLPolicyError describes a missing explicit policy acknowledgement for Raw SQL execution.
+type RawSQLPolicyError struct {
+	Base      *Error
+	Operation string
+	Hint      string
+}
+
 // TransactionError describes begin/commit/rollback failures.
 type TransactionError struct {
 	Base      *Error
@@ -370,6 +379,14 @@ func NewSeedError(kind Kind, model, key string, conflict map[string]any, err err
 	}
 }
 
+func NewRawSQLPolicyError(operation, hint string, err error) error {
+	return &RawSQLPolicyError{
+		Base:      &Error{Kind: KindRawSQLPolicyRequired, Message: buildRawSQLPolicyMessage(operation, hint), Err: err},
+		Operation: operation,
+		Hint:      hint,
+	}
+}
+
 func (e *SeedError) Error() string {
 	if e == nil {
 		return ""
@@ -381,6 +398,23 @@ func (e *SeedError) Error() string {
 }
 
 func (e *SeedError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Base
+}
+
+func (e *RawSQLPolicyError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Base != nil && e.Base.Message != "" {
+		return e.Base.Error()
+	}
+	return buildRawSQLPolicyMessage(e.Operation, e.Hint)
+}
+
+func (e *RawSQLPolicyError) Unwrap() error {
 	if e == nil {
 		return nil
 	}
@@ -476,6 +510,17 @@ func buildSeedMessage(model, key string, conflict map[string]any) string {
 			values = append(values, fmt.Sprintf("%s=%v", k, conflict[k]))
 		}
 		parts = append(parts, strings.Join(values, ","))
+	}
+	return strings.Join(parts, ": ")
+}
+
+func buildRawSQLPolicyMessage(operation, hint string) string {
+	parts := []string{"raw SQL requires an explicit policy decision"}
+	if operation != "" {
+		parts = append(parts, "operation="+operation)
+	}
+	if hint != "" {
+		parts = append(parts, hint)
 	}
 	return strings.Join(parts, ": ")
 }

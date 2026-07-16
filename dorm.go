@@ -33,6 +33,7 @@ var (
 	ErrCommitFailed         = dormerrors.ErrCommitFailed
 	ErrRollbackFailed       = dormerrors.ErrRollbackFailed
 	ErrOptimisticLockFailed = dormerrors.ErrOptimisticLockFailed
+	ErrRawSQLPolicyRequired = dormerrors.ErrRawSQLPolicyRequired
 )
 
 type OpenOption func(*openConfig)

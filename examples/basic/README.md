@@ -11,8 +11,17 @@ It shows:
 - `Find`
 - `Update`
 - `Delete`
+- explicit Raw SQL via `WithoutPolicy()`
 - a simple lifecycle hook
 - request-scoped context usage
+
+Raw SQL uses generic `?` placeholders and participates in the current transaction automatically:
+
+```go
+err := db.Raw(ctx, `SELECT * FROM users WHERE email = ?`, email).
+    WithoutPolicy().
+    Scan(&users)
+```
 
 Run it with:
 

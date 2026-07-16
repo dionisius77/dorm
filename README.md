@@ -158,6 +158,37 @@ SQL visibility is configurable:
 
 ---
 
+## Raw SQL Escape Hatch
+
+`dorm` also supports explicit native SQL for cases where the high-level API is not the best fit.
+
+Raw SQL never bypasses access policy implicitly.
+
+Developers must explicitly opt out:
+
+```go
+db.Raw(
+    ctx,
+    `
+    SELECT *
+    FROM users
+    WHERE email = ?
+    `,
+    email,
+).
+    WithoutPolicy().
+    Scan(&users)
+```
+
+Notes:
+
+* `WithoutPolicy()` is required before `Scan()` or `Exec()`
+* `?` placeholders are rebound by the active dialect
+* Raw SQL participates in the current transaction automatically
+* The ORM does not parse or rewrite SQL beyond placeholder conversion
+
+---
+
 ## Composable Models
 
 Choose only the capabilities your model requires.

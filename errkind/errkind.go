@@ -13,6 +13,7 @@ const (
 	KindMigrationApplication = dormerrors.KindMigrationApplication
 	KindRuntimeQuery         = dormerrors.KindRuntimeQuery
 	KindAccessViolation      = dormerrors.KindAccessViolation
+	KindRawSQLPolicyRequired = dormerrors.KindRawSQLPolicyRequired
 )
 
 var (
@@ -23,6 +24,7 @@ var (
 	ErrMigrationApplication = dormerrors.ErrMigrationApplication
 	ErrRuntimeQuery         = dormerrors.ErrRuntimeQuery
 	ErrAccessViolation      = dormerrors.ErrAccessViolation
+	ErrRawSQLPolicyRequired = dormerrors.ErrRawSQLPolicyRequired
 )
 
 func New(kind Kind, msg string) error {

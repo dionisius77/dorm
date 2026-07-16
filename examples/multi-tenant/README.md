@@ -8,6 +8,9 @@ It demonstrates:
 - `IgnoreCompany`
 - `IgnoreRLS`
 - `System`
+- Raw SQL as an explicit escape hatch with `WithoutPolicy()`
+
+Raw SQL still requires an explicit policy decision and uses the active dialect to convert `?` placeholders.
 
 Run it with:
 
