@@ -4,7 +4,7 @@ import (
 	"fmt"
 	"sort"
 
-	"github.com/dionisius77/dorm/errkind"
+	dormerrors "github.com/dionisius77/dorm/errors"
 )
 
 type OperationKind string
@@ -39,7 +39,7 @@ func (d Diff) Empty() bool { return len(d.Operations) == 0 }
 
 func Compare(expected, actual *Schema) (*Diff, error) {
 	if expected == nil || actual == nil {
-		return nil, errkind.New(errkind.KindInvalidSchema, "schema: compare requires non-nil schemas")
+		return nil, dormerrors.NewSchemaError(dormerrors.KindInvalidSchema, schemaLabel(expected), schemaLabel(actual), "compare requires non-nil schemas", nil)
 	}
 	expected = expected.Clone()
 	actual = actual.Clone()
@@ -71,6 +71,16 @@ func Compare(expected, actual *Schema) (*Diff, error) {
 		return diff.Operations[i].Table < diff.Operations[j].Table
 	})
 	return diff, nil
+}
+
+func schemaLabel(s *Schema) string {
+	if s == nil {
+		return "nil"
+	}
+	if s.Name != "" {
+		return s.Name
+	}
+	return "unknown"
 }
 
 func compareTable(expected, actual *Table) []Operation {

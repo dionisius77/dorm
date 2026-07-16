@@ -11,6 +11,7 @@ It shows:
 - `Find`
 - `Update`
 - `Delete`
+- a simple lifecycle hook
 - request-scoped context usage
 
 Run it with:

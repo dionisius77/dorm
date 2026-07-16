@@ -3,7 +3,6 @@ package orm
 import (
 	"context"
 	"database/sql"
-	"errors"
 	"fmt"
 	"reflect"
 	"strings"
@@ -13,10 +12,11 @@ import (
 	"github.com/dionisius77/dorm/access"
 	"github.com/dionisius77/dorm/dialect"
 	"github.com/dionisius77/dorm/errkind"
+	dormerrors "github.com/dionisius77/dorm/errors"
 	"github.com/dionisius77/dorm/schema"
 )
 
-var ErrNotFound = errors.New("orm: not found")
+var ErrNotFound = dormerrors.ErrNotFound
 
 var (
 	tableMetaCache sync.Map // map[reflect.Type]*schema.Table
@@ -42,6 +42,7 @@ type Config struct {
 type DB struct {
 	db                  *sql.DB
 	tx                  *sql.Tx
+	ctx                 context.Context
 	dialect             dialect.Dialect
 	driverName          string
 	schema              *schema.Schema
@@ -51,7 +52,9 @@ type DB struct {
 	prepareStatements   bool
 	softDeleteByDefault bool
 	stmtMu              sync.Mutex
+	txMu                sync.Mutex
 	stmts               map[string]*sql.Stmt
+	txState             *transactionState
 }
 
 type Session struct {
@@ -69,6 +72,7 @@ func New(cfg Config) *DB {
 	return &DB{
 		db:                  cfg.DB,
 		tx:                  cfg.Tx,
+		ctx:                 context.Background(),
 		dialect:             cfg.Dialect,
 		driverName:          cfg.DriverName,
 		schema:              cfg.Schema,
@@ -118,9 +122,6 @@ func (s *Session) WithPolicy(policy access.Policy) *Session {
 
 func (s *Session) Find(dest any, opts ...QueryOption) error {
 	return s.db.traceOperation(s.ctx, "db.query", []Attribute{{Key: "orm.operation", Value: "find"}}, func(ctx context.Context) error {
-		if err := invokeBeforeFindHook(ctx, dest); err != nil {
-			return err
-		}
 		state, err := s.buildState(dest, opts...)
 		if err != nil {
 			return err
@@ -137,7 +138,7 @@ func (s *Session) Find(dest any, opts ...QueryOption) error {
 		if err := scanIntoSlice(rows, dest, state.table); err != nil {
 			return err
 		}
-		return invokeAfterFindHooks(ctx, reflect.ValueOf(dest).Elem())
+		return invokeAfterFindHooks(ctx, s.db, reflect.ValueOf(dest).Elem())
 	})
 }
 
@@ -212,7 +213,7 @@ func (s *Session) Count(model any, opts ...QueryOption) (int64, error) {
 func (s *Session) Create(model any) error {
 	return s.db.traceOperation(s.ctx, "db.insert", []Attribute{{Key: "orm.operation", Value: "create"}}, func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
-		if err := invokeBeforeCreateHook(ctx, model); err != nil {
+		if err := invokeBeforeCreateHook(ctx, s.db, model); err != nil {
 			return err
 		}
 		meta, rv, err := s.resolveModel(model)
@@ -239,7 +240,7 @@ func (s *Session) Create(model any) error {
 		if err := s.db.execReturning(ctx, sqlText, args, model, table); err != nil {
 			return err
 		}
-		return invokeAfterCreateHook(ctx, model)
+		return invokeAfterCreateHook(ctx, s.db, model)
 	})
 }
 
@@ -255,7 +256,7 @@ func (s *Session) UpdateWhere(model any, opts ...QueryOption) error {
 func (s *Session) update(model any, opts []QueryOption, usePrimaryKey bool) error {
 	return s.db.traceOperation(s.ctx, "db.update", []Attribute{{Key: "orm.operation", Value: "update"}}, func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
-		if err := invokeBeforeUpdateHook(ctx, model); err != nil {
+		if err := invokeBeforeUpdateHook(ctx, s.db, model); err != nil {
 			return err
 		}
 		meta, rv, err := s.resolveModel(model)
@@ -309,14 +310,14 @@ func (s *Session) update(model any, opts []QueryOption, usePrimaryKey bool) erro
 		if err := s.db.execReturning(ctx, sqlText, append(args, whereArgs...), model, table); err != nil {
 			return err
 		}
-		return invokeAfterUpdateHook(ctx, model)
+		return invokeAfterUpdateHook(ctx, s.db, model)
 	})
 }
 
 func (s *Session) Delete(model any) error {
 	return s.db.traceOperation(s.ctx, "db.delete", []Attribute{{Key: "orm.operation", Value: "delete"}}, func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
-		if err := invokeBeforeDeleteHook(ctx, model); err != nil {
+		if err := invokeBeforeDeleteHook(ctx, s.db, model); err != nil {
 			return err
 		}
 		meta, rv, err := s.resolveModel(model)
@@ -325,7 +326,10 @@ func (s *Session) Delete(model any) error {
 		}
 		table := meta.table
 		if soft := softDeleteColumn(table); soft != nil && access.PolicyFromContext(ctx).EnforcesSoftDelete() {
-			return s.softDelete(model, table, rv, soft)
+			if err := s.softDelete(model, table, rv, soft); err != nil {
+				return err
+			}
+			return invokeAfterDeleteHook(ctx, s.db, model)
 		}
 		pkCols, pkArgs, err := primaryKeyValues(table, rv)
 		if err != nil {
@@ -343,14 +347,14 @@ func (s *Session) Delete(model any) error {
 		if err != nil {
 			return err
 		}
-		return invokeAfterDeleteHook(ctx, model)
+		return invokeAfterDeleteHook(ctx, s.db, model)
 	})
 }
 
 func (s *Session) SoftDelete(model any) error {
 	return s.db.traceOperation(s.ctx, "db.delete", []Attribute{{Key: "orm.operation", Value: "soft_delete"}}, func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
-		if err := invokeBeforeDeleteHook(ctx, model); err != nil {
+		if err := invokeBeforeDeleteHook(ctx, s.db, model); err != nil {
 			return err
 		}
 		meta, rv, err := s.resolveModel(model)
@@ -365,7 +369,7 @@ func (s *Session) SoftDelete(model any) error {
 		if err := s.softDelete(model, table, rv, soft); err != nil {
 			return err
 		}
-		return invokeAfterDeleteHook(ctx, model)
+		return invokeAfterDeleteHook(ctx, s.db, model)
 	})
 }
 
@@ -399,45 +403,6 @@ func (s *Session) Upsert(model any) error {
 		set := upsertSetClauses(table, values, conflict, s.db.dialect)
 		sqlText := strings.TrimSuffix(insertSQL, ";") + " ON CONFLICT (" + strings.Join(quoteColumns(conflict, s.db.dialect), ", ") + ") DO UPDATE SET " + strings.Join(set, ", ") + ";"
 		return s.db.execReturning(ctx, sqlText, args, model, table)
-	})
-}
-
-func (s *Session) Tx(fn func(*Session) error) error {
-	return s.db.Tx(s.ctx, fn)
-}
-
-func (db *DB) Tx(ctx context.Context, fn func(*Session) error) error {
-	return db.traceOperation(ctx, "db.transaction", []Attribute{{Key: "orm.operation", Value: "transaction"}}, func(ctx context.Context) error {
-		if db.tx != nil {
-			return fn(&Session{db: db, ctx: ctx})
-		}
-		if db.db == nil {
-			return errkind.New(errkind.KindConfiguration, "orm: nil db")
-		}
-		tx, err := db.db.BeginTx(ctx, nil)
-		if err != nil {
-			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: begin transaction", err)
-		}
-		child := *db
-		child.tx = tx
-		child.db = nil
-		child.stmts = map[string]*sql.Stmt{}
-		s := &Session{db: &child, ctx: ctx}
-		if err := fn(s); err != nil {
-			rollbackErr := db.traceOperation(ctx, "db.rollback", []Attribute{{Key: "orm.operation", Value: "rollback"}}, func(context.Context) error {
-				return tx.Rollback()
-			})
-			if rollbackErr != nil {
-				return rollbackErr
-			}
-			return err
-		}
-		if err := db.traceOperation(ctx, "db.commit", []Attribute{{Key: "orm.operation", Value: "commit"}}, func(context.Context) error {
-			return tx.Commit()
-		}); err != nil {
-			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: commit transaction", err)
-		}
-		return nil
 	})
 }
 
@@ -1148,6 +1113,9 @@ func isZeroValue(v any) bool {
 }
 
 func (db *DB) execContext(ctx context.Context, sqlText string, args ...any) (sql.Result, error) {
+	if err := db.transactionClosedError("exec"); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	entry := SQLLogEntry{
 		SQL:        sqlText,
@@ -1241,6 +1209,9 @@ func (db *DB) execContext(ctx context.Context, sqlText string, args ...any) (sql
 }
 
 func (db *DB) queryContext(ctx context.Context, sqlText string, args ...any) (*sql.Rows, error) {
+	if err := db.transactionClosedError("query"); err != nil {
+		return nil, err
+	}
 	start := time.Now()
 	entry := SQLLogEntry{
 		SQL:        sqlText,

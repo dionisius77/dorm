@@ -12,6 +12,7 @@ import (
 	"github.com/dionisius77/dorm"
 	"github.com/dionisius77/dorm/access"
 	"github.com/dionisius77/dorm/errkind"
+	dormerrors "github.com/dionisius77/dorm/errors"
 	"github.com/dionisius77/dorm/orm"
 	"github.com/dionisius77/dorm/schema"
 )
@@ -314,7 +315,7 @@ func syncOne(ctx context.Context, session *orm.Session, item reflect.Value, keys
 		mergeSeedAuditFields(record, current)
 		return session.UpdateWhere(record.Addr().Interface(), whereOpts...)
 	default:
-		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("seed: key matched multiple rows for %s", record.Type().Name()))
+		return dormerrors.NewSeedError(dormerrors.KindSeedConflict, record.Type().Name(), strings.Join(keys, ","), map[string]any{"rows": existing.Len()}, nil)
 	}
 }
 

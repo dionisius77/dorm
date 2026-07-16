@@ -13,27 +13,27 @@ import (
 )
 
 type BeforeCreateHook interface {
-	BeforeCreate(context.Context) error
+	BeforeCreate(context.Context, *DB) error
 }
 
 type AfterCreateHook interface {
-	AfterCreate(context.Context) error
+	AfterCreate(context.Context, *DB) error
 }
 
 type BeforeUpdateHook interface {
-	BeforeUpdate(context.Context) error
+	BeforeUpdate(context.Context, *DB) error
 }
 
 type AfterUpdateHook interface {
-	AfterUpdate(context.Context) error
+	AfterUpdate(context.Context, *DB) error
 }
 
 type BeforeDeleteHook interface {
-	BeforeDelete(context.Context) error
+	BeforeDelete(context.Context, *DB) error
 }
 
 type AfterDeleteHook interface {
-	AfterDelete(context.Context) error
+	AfterDelete(context.Context, *DB) error
 }
 
 type BeforeFindHook interface {
@@ -41,7 +41,7 @@ type BeforeFindHook interface {
 }
 
 type AfterFindHook interface {
-	AfterFind(context.Context) error
+	AfterFind(context.Context, *DB) error
 }
 
 func (s *Session) Load(dest any, relation string) error {
@@ -152,7 +152,7 @@ func (s *Session) loadBelongsToRelation(parent, relationField reflect.Value, rel
 	if err := scanIntoSlice(rows, targetSlice.Interface(), targetTable); err != nil {
 		return err
 	}
-	if err := invokeAfterFindHooks(s.ctx, targetSlice.Elem()); err != nil {
+	if err := invokeAfterFindHooks(s.ctx, s.db, targetSlice.Elem()); err != nil {
 		return err
 	}
 	if targetSlice.Elem().Len() == 0 {
@@ -215,70 +215,75 @@ func (s *Session) loadHasManyRelation(parent, relationField reflect.Value, relat
 	if err := scanIntoSlice(rows, targetSlice.Interface(), childTable); err != nil {
 		return err
 	}
-	if err := invokeAfterFindHooks(s.ctx, targetSlice.Elem()); err != nil {
+	if err := invokeAfterFindHooks(s.ctx, s.db, targetSlice.Elem()); err != nil {
 		return err
 	}
 	relationField.Set(targetSlice.Elem())
 	return nil
 }
 
-func invokeBeforeCreateHook(ctx context.Context, model any) error {
-	if hook, ok := model.(BeforeCreateHook); ok {
-		return hook.BeforeCreate(ctx)
-	}
-	return nil
+func invokeBeforeCreateHook(ctx context.Context, db *DB, model any) error {
+	return invokeLifecycleHook(ctx, db, "BeforeCreate", model, func(ctx context.Context) error {
+		if hook, ok := model.(BeforeCreateHook); ok {
+			return hook.BeforeCreate(ctx, db)
+		}
+		return nil
+	})
 }
 
-func invokeAfterCreateHook(ctx context.Context, model any) error {
-	if hook, ok := model.(AfterCreateHook); ok {
-		return hook.AfterCreate(ctx)
-	}
-	return nil
+func invokeAfterCreateHook(ctx context.Context, db *DB, model any) error {
+	return invokeLifecycleHook(ctx, db, "AfterCreate", model, func(ctx context.Context) error {
+		if hook, ok := model.(AfterCreateHook); ok {
+			return hook.AfterCreate(ctx, db)
+		}
+		return nil
+	})
 }
 
-func invokeBeforeUpdateHook(ctx context.Context, model any) error {
-	if hook, ok := model.(BeforeUpdateHook); ok {
-		return hook.BeforeUpdate(ctx)
-	}
-	return nil
+func invokeBeforeUpdateHook(ctx context.Context, db *DB, model any) error {
+	return invokeLifecycleHook(ctx, db, "BeforeUpdate", model, func(ctx context.Context) error {
+		if hook, ok := model.(BeforeUpdateHook); ok {
+			return hook.BeforeUpdate(ctx, db)
+		}
+		return nil
+	})
 }
 
-func invokeAfterUpdateHook(ctx context.Context, model any) error {
-	if hook, ok := model.(AfterUpdateHook); ok {
-		return hook.AfterUpdate(ctx)
-	}
-	return nil
+func invokeAfterUpdateHook(ctx context.Context, db *DB, model any) error {
+	return invokeLifecycleHook(ctx, db, "AfterUpdate", model, func(ctx context.Context) error {
+		if hook, ok := model.(AfterUpdateHook); ok {
+			return hook.AfterUpdate(ctx, db)
+		}
+		return nil
+	})
 }
 
-func invokeBeforeDeleteHook(ctx context.Context, model any) error {
-	if hook, ok := model.(BeforeDeleteHook); ok {
-		return hook.BeforeDelete(ctx)
-	}
-	return nil
+func invokeBeforeDeleteHook(ctx context.Context, db *DB, model any) error {
+	return invokeLifecycleHook(ctx, db, "BeforeDelete", model, func(ctx context.Context) error {
+		if hook, ok := model.(BeforeDeleteHook); ok {
+			return hook.BeforeDelete(ctx, db)
+		}
+		return nil
+	})
 }
 
-func invokeAfterDeleteHook(ctx context.Context, model any) error {
-	if hook, ok := model.(AfterDeleteHook); ok {
-		return hook.AfterDelete(ctx)
-	}
-	return nil
+func invokeAfterDeleteHook(ctx context.Context, db *DB, model any) error {
+	return invokeLifecycleHook(ctx, db, "AfterDelete", model, func(ctx context.Context) error {
+		if hook, ok := model.(AfterDeleteHook); ok {
+			return hook.AfterDelete(ctx, db)
+		}
+		return nil
+	})
 }
 
-func invokeBeforeFindHook(ctx context.Context, dest any) error {
-	if hook, ok := dest.(BeforeFindHook); ok {
-		return hook.BeforeFind(ctx)
-	}
-	return nil
-}
-
-func invokeAfterFindHooks(ctx context.Context, rv reflect.Value) error {
+func invokeAfterFindHooks(ctx context.Context, db *DB, rv reflect.Value) error {
 	if !rv.IsValid() {
 		return nil
 	}
 	switch rv.Kind() {
 	case reflect.Slice:
 		for i := 0; i < rv.Len(); i++ {
-			if err := invokeAfterFindHooks(ctx, rv.Index(i)); err != nil {
+			if err := invokeAfterFindHooks(ctx, db, rv.Index(i)); err != nil {
 				return err
 			}
 		}
@@ -287,20 +292,67 @@ func invokeAfterFindHooks(ctx context.Context, rv reflect.Value) error {
 		if rv.IsNil() {
 			return nil
 		}
-		return invokeAfterFindHooks(ctx, rv.Elem())
+		return invokeAfterFindHooks(ctx, db, rv.Elem())
 	case reflect.Struct:
+		model := rv.Interface()
 		if rv.CanAddr() {
-			if hook, ok := rv.Addr().Interface().(AfterFindHook); ok {
-				return hook.AfterFind(ctx)
+			model = rv.Addr().Interface()
+		}
+		return invokeLifecycleHook(ctx, db, "AfterFind", model, func(ctx context.Context) error {
+			if hook, ok := model.(AfterFindHook); ok {
+				return hook.AfterFind(ctx, db)
 			}
-		}
-		if hook, ok := rv.Interface().(AfterFindHook); ok {
-			return hook.AfterFind(ctx)
-		}
-		return nil
+			return nil
+		})
 	default:
 		return nil
 	}
+}
+
+func invokeLifecycleHook(ctx context.Context, db *DB, hookName string, model any, fn func(context.Context) error) error {
+	if fn == nil {
+		return nil
+	}
+	if db == nil {
+		return fn(ctx)
+	}
+	modelName := lifecycleHookModelName(model)
+	spanName := "db.hook." + schema.ToSnakeCase(hookName)
+	return db.traceWithSpan(ctx, spanName, []Attribute{
+		{Key: "orm.hook", Value: hookName},
+		{Key: "orm.model", Value: modelName},
+	}, func(ctx context.Context, span Span) error {
+		addHookEvent(span, hookName, modelName)
+		if err := fn(ctx); err != nil {
+			return fmt.Errorf("%s(%s): %w", hookName, modelName, err)
+		}
+		return nil
+	})
+}
+
+func addHookEvent(span Span, hookName, modelName string) {
+	if span == nil {
+		return
+	}
+	if eventer, ok := span.(interface {
+		AddEvent(string, ...Attribute)
+	}); ok {
+		eventer.AddEvent(hookName, Attribute{Key: "orm.hook", Value: hookName}, Attribute{Key: "orm.model", Value: modelName})
+	}
+}
+
+func lifecycleHookModelName(model any) string {
+	if model == nil {
+		return ""
+	}
+	t := reflect.TypeOf(model)
+	for t.Kind() == reflect.Pointer {
+		t = t.Elem()
+	}
+	if t.Name() != "" {
+		return t.Name()
+	}
+	return t.String()
 }
 
 func structFieldByName(rv reflect.Value, name string) (reflect.Value, reflect.StructField, bool) {

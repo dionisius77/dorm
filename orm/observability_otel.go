@@ -236,6 +236,17 @@ func (s otelSpanAdapter) SetAttributes(attrs ...Attribute) {
 	s.span.SetAttributes(toOTELAttributes(attrs)...)
 }
 
+func (s otelSpanAdapter) AddEvent(name string, attrs ...Attribute) {
+	if s.span == nil {
+		return
+	}
+	if len(attrs) == 0 {
+		s.span.AddEvent(name)
+		return
+	}
+	s.span.AddEvent(name, oteltrace.WithAttributes(toOTELAttributes(attrs)...))
+}
+
 func isSlowQuery(duration time.Duration, threshold time.Duration) bool {
 	return threshold > 0 && duration >= threshold
 }

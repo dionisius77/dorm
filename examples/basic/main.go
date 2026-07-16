@@ -20,6 +20,15 @@ type User struct {
 	UpdatedAt time.Time `orm:"updated_at"`
 }
 
+func (u *User) BeforeCreate(ctx context.Context, tx *dorm.DB) error {
+	_ = ctx
+	_ = tx
+	if u.Name == "" {
+		u.Name = u.Email
+	}
+	return nil
+}
+
 func main() {
 	ctx := access.WithContext(context.Background(), access.Context{
 		UserID: "demo-user",

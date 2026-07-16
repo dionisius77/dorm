@@ -14,6 +14,7 @@ import (
 
 	"github.com/dionisius77/dorm/dialect"
 	"github.com/dionisius77/dorm/errkind"
+	dormerrors "github.com/dionisius77/dorm/errors"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -75,12 +76,12 @@ func (s *Service) Generate(ctx context.Context) (*Result, error) {
 		}
 		upSQL, err := s.Config.Dialect.RenderMigration(diff)
 		if err != nil {
-			return errkind.Wrap(errkind.KindUnsupportedFeature, "migrate: render migration", err)
+			return dormerrors.NewMigrationError(dormerrors.KindUnsupportedFeature, "", "", 0, err)
 		}
 		downDiff := invertDiff(diff)
 		downSQL, err := s.Config.Dialect.RenderMigration(downDiff)
 		if err != nil {
-			return errkind.Wrap(errkind.KindUnsupportedFeature, "migrate: render rollback migration", err)
+			return dormerrors.NewMigrationError(dormerrors.KindUnsupportedFeature, "", "", 0, err)
 		}
 		name := s.nextMigrationName()
 		snapshot := &schema.Snapshot{GeneratedAt: time.Now().UTC(), Schema: current}
@@ -111,7 +112,7 @@ func (s *Service) Write(result *Result) error {
 			return errkind.New(errkind.KindConfiguration, "migrate: empty migrations dir")
 		}
 		if err := os.MkdirAll(s.Config.MigrationsDir, 0o755); err != nil {
-			return errkind.Wrap(errkind.KindMigrationGeneration, "migrate: create migrations dir", err)
+			return dormerrors.NewMigrationError(dormerrors.KindMigrationGeneration, s.Config.MigrationsDir, "", 0, err)
 		}
 		if result.MigrationName == "" {
 			result.MigrationName = s.nextMigrationName()
@@ -119,14 +120,14 @@ func (s *Service) Write(result *Result) error {
 		upPath := filepath.Join(s.Config.MigrationsDir, result.MigrationName+".up.sql")
 		downPath := filepath.Join(s.Config.MigrationsDir, result.MigrationName+".down.sql")
 		if err := os.WriteFile(upPath, []byte(strings.Join(result.UpSQL, "\n\n")+"\n"), 0o644); err != nil {
-			return errkind.Wrap(errkind.KindMigrationGeneration, "migrate: write up migration", err)
+			return dormerrors.NewMigrationError(dormerrors.KindMigrationGeneration, upPath, "", 0, err)
 		}
 		if err := os.WriteFile(downPath, []byte(strings.Join(result.DownSQL, "\n\n")+"\n"), 0o644); err != nil {
-			return errkind.Wrap(errkind.KindMigrationGeneration, "migrate: write down migration", err)
+			return dormerrors.NewMigrationError(dormerrors.KindMigrationGeneration, downPath, "", 0, err)
 		}
 		if s.Config.SnapshotPath != "" && result.Snapshot != nil {
 			if err := schema.SaveSnapshot(s.Config.SnapshotPath, result.Snapshot); err != nil {
-				return errkind.Wrap(errkind.KindMigrationGeneration, "migrate: save snapshot", err)
+				return dormerrors.NewMigrationError(dormerrors.KindMigrationGeneration, s.Config.SnapshotPath, "", 0, err)
 			}
 		}
 		return nil
@@ -145,15 +146,15 @@ func (s *Service) Run(ctx context.Context, db *sql.DB) error {
 			return errkind.New(errkind.KindConfiguration, "migrate: empty migrations dir")
 		}
 		if err := ensureMigrationRegistry(ctx, db); err != nil {
-			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: ensure registry", err)
+			return dormerrors.NewMigrationError(dormerrors.KindMigrationApplication, "", "", 0, err)
 		}
 		applied, err := appliedMigrationSet(ctx, db)
 		if err != nil {
-			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: read applied migrations", err)
+			return dormerrors.NewMigrationError(dormerrors.KindMigrationApplication, "", "", 0, err)
 		}
 		files, err := filepath.Glob(filepath.Join(s.Config.MigrationsDir, "*.up.sql"))
 		if err != nil {
-			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: glob migrations", err)
+			return dormerrors.NewMigrationError(dormerrors.KindMigrationApplication, s.Config.MigrationsDir, "", 0, err)
 		}
 		sort.Strings(files)
 		for _, file := range files {
@@ -163,13 +164,13 @@ func (s *Service) Run(ctx context.Context, db *sql.DB) error {
 			}
 			sqlBytes, err := os.ReadFile(file)
 			if err != nil {
-				return errkind.Wrap(errkind.KindMigrationApplication, "migrate: read migration file", err)
+				return dormerrors.NewMigrationError(dormerrors.KindMigrationApplication, file, "", 0, err)
 			}
 			if _, err := db.ExecContext(ctx, string(sqlBytes)); err != nil {
-				return errkind.Wrap(errkind.KindMigrationApplication, fmt.Sprintf("migrate: apply %s", filepath.Base(file)), err)
+				return dormerrors.NewMigrationError(dormerrors.KindMigrationApplication, file, string(sqlBytes), 0, err)
 			}
 			if err := recordAppliedMigration(ctx, db, name, checksum(sqlBytes)); err != nil {
-				return errkind.Wrap(errkind.KindMigrationApplication, "migrate: record applied migration", err)
+				return dormerrors.NewMigrationError(dormerrors.KindMigrationApplication, file, "", 0, err)
 			}
 		}
 		return nil
@@ -190,13 +191,13 @@ func (s *Service) Revert(ctx context.Context, db *sql.DB, name string) error {
 		path := filepath.Join(s.Config.MigrationsDir, name+".down.sql")
 		sqlBytes, err := os.ReadFile(path)
 		if err != nil {
-			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: read down migration", err)
+			return dormerrors.NewMigrationError(dormerrors.KindMigrationApplication, path, "", 0, err)
 		}
 		if _, err = db.ExecContext(ctx, string(sqlBytes)); err != nil {
-			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: revert migration", err)
+			return dormerrors.NewMigrationError(dormerrors.KindMigrationApplication, path, string(sqlBytes), 0, err)
 		}
 		if err := removeAppliedMigration(ctx, db, name); err != nil {
-			return errkind.Wrap(errkind.KindMigrationApplication, "migrate: remove applied migration", err)
+			return dormerrors.NewMigrationError(dormerrors.KindMigrationApplication, path, "", 0, err)
 		}
 		return nil
 	})

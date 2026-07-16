@@ -6,9 +6,9 @@ const (
 	// VersionMajor is the major release component for the current public API.
 	VersionMajor = 0
 	// VersionMinor is the minor release component for the current public API.
-	VersionMinor = 1
+	VersionMinor = 3
 	// VersionPatch is the patch release component for the current public API.
-	VersionPatch = 8
+	VersionPatch = 0
 )
 
 // Version returns the current module version in semantic version format.

@@ -30,3 +30,6 @@ This directory contains the architectural contract for the ORM.
 - [ADR-024: Composable Model Traits](./ADR-024-composable-model-traits.md)
 - [ADR-025: Seeding & Data Initialization](./ADR-025-seeding-data-initialization.md)
 - [ADR-026: SQL Observability & Trace Visibility](./ADR-026-sql-observability-trace-visibility.md)
+- [ADR-027: Error Model & Error Handling](./ADR-027-error-model.md)
+- [ADR-028: Transaction API & Transaction Lifecycle](./ADR-028-transaction-api.md)
+- [ADR-029: Lifecycle Hooks](./ADR-029-lifecycle-hooks.md)

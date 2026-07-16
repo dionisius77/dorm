@@ -3,6 +3,7 @@ package postgres
 import (
 	"context"
 	"database/sql"
+	"fmt"
 	"net/url"
 	"sort"
 	"strconv"
@@ -13,7 +14,7 @@ import (
 	"github.com/dionisius77/dorm/dialect"
 	pgdialect "github.com/dionisius77/dorm/dialect/postgres"
 	"github.com/dionisius77/dorm/driver"
-	"github.com/dionisius77/dorm/errkind"
+	dormerrors "github.com/dionisius77/dorm/errors"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -98,13 +99,13 @@ func normalizeConfig(cfg Config) Config {
 
 func (d *Driver) Validate() error {
 	if d == nil {
-		return errkind.New(errkind.KindConfiguration, "postgres driver: nil driver")
+		return dormerrors.NewDriverError(dormerrors.KindConfiguration, defaultDriverName, "validate", fmt.Errorf("nil driver"))
 	}
 	if d.dialect == nil {
-		return errkind.New(errkind.KindConfiguration, "postgres driver: nil dialect")
+		return dormerrors.NewDriverError(dormerrors.KindConfiguration, d.Name(), "validate", fmt.Errorf("nil dialect"))
 	}
 	if strings.TrimSpace(d.cfg.DSN) == "" && strings.TrimSpace(d.cfg.Database) == "" {
-		return errkind.New(errkind.KindConfiguration, "postgres driver: database is required")
+		return dormerrors.NewDriverError(dormerrors.KindConfiguration, d.Name(), "validate", fmt.Errorf("database is required"))
 	}
 	return nil
 }
@@ -146,7 +147,7 @@ func (d *Driver) Open(ctx context.Context) (*sql.DB, error) {
 	ensureRegistered(d.Name())
 	db, err := sql.Open(d.Name(), d.dsn())
 	if err != nil {
-		return nil, errkind.Wrap(errkind.KindConfiguration, "postgres driver: open database", err)
+		return nil, dormerrors.NewDriverError(dormerrors.KindConfiguration, d.Name(), "open", err)
 	}
 	if d.cfg.MaxOpenConns > 0 {
 		db.SetMaxOpenConns(d.cfg.MaxOpenConns)

@@ -5,6 +5,7 @@ import (
 	"fmt"
 
 	"github.com/dionisius77/dorm/errkind"
+	dormerrors "github.com/dionisius77/dorm/errors"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -38,24 +39,65 @@ type FieldValue struct {
 
 // MissingContextError reports a required access context value that was absent.
 type MissingContextError struct {
+	Base      *dormerrors.AccessError
 	Operation Operation
 	Field     string
 	Reason    string
 }
 
 func (e *MissingContextError) Is(target error) bool {
-	t, ok := target.(*errkind.Error)
-	return ok && t.Kind == errkind.KindAccessViolation
+	if e == nil {
+		return false
+	}
+	if target == nil {
+		return false
+	}
+	switch target {
+	case dormerrors.ErrInvalidContext, dormerrors.ErrMissingCompany, dormerrors.ErrPolicyDenied, dormerrors.ErrAccessViolation:
+		return true
+	}
+	if t, ok := target.(*dormerrors.Error); ok {
+		switch t.Kind {
+		case dormerrors.KindInvalidContext, dormerrors.KindMissingCompany, dormerrors.KindPolicyDenied, dormerrors.KindAccessViolation:
+			return true
+		}
+	}
+	return dormerrors.Is(e.Base, target)
 }
 
 func (e *MissingContextError) Error() string {
 	if e == nil {
 		return "access: missing context"
 	}
+	if e.Base != nil {
+		return e.Base.Error()
+	}
 	if e.Reason != "" {
 		return fmt.Sprintf("access: %s requires %s: %s", e.Operation, e.Field, e.Reason)
 	}
 	return fmt.Sprintf("access: %s requires %s", e.Operation, e.Field)
+}
+
+func (e *MissingContextError) Unwrap() error {
+	if e == nil {
+		return nil
+	}
+	return e.Base
+}
+
+func newMissingContextError(op Operation, field, reason string) error {
+	kind := dormerrors.KindInvalidContext
+	if field == "CompanyID" {
+		kind = dormerrors.KindMissingCompany
+	}
+	base := &dormerrors.AccessError{
+		Base:      &dormerrors.Error{Kind: kind, Message: fmt.Sprintf("access: %s requires %s: %s", op, field, reason)},
+		Operation: string(op),
+		Policy:    "default",
+		Field:     field,
+		Reason:    reason,
+	}
+	return &MissingContextError{Base: base, Operation: op, Field: field, Reason: reason}
 }
 
 func (Engine) Apply(ctx context.Context, table *schema.Table, op Operation, values map[string]any) ([]Predicate, []FieldValue, error) {
@@ -159,27 +201,27 @@ func validateContextForOperation(ac Context, table *schema.Table, op Operation, 
 			switch col.Scope {
 			case schema.ScopeCompany:
 				if ac.CompanyID == nil {
-					return &MissingContextError{Operation: op, Field: "CompanyID", Reason: "company-scoped model requires company context"}
+					return newMissingContextError(op, "CompanyID", "company-scoped model requires company context")
 				}
 			case schema.ScopeTenant:
 				if ac.TenantID == nil {
-					return &MissingContextError{Operation: op, Field: "TenantID", Reason: "tenant-scoped model requires tenant context"}
+					return newMissingContextError(op, "TenantID", "tenant-scoped model requires tenant context")
 				}
 			case schema.ScopeOrganization:
 				if ac.OrganizationID == nil {
-					return &MissingContextError{Operation: op, Field: "OrganizationID", Reason: "organization-scoped model requires organization context"}
+					return newMissingContextError(op, "OrganizationID", "organization-scoped model requires organization context")
 				}
 			case schema.ScopeWorkspace:
 				if ac.WorkspaceID == nil {
-					return &MissingContextError{Operation: op, Field: "WorkspaceID", Reason: "workspace-scoped model requires workspace context"}
+					return newMissingContextError(op, "WorkspaceID", "workspace-scoped model requires workspace context")
 				}
 			case schema.ScopeWarehouse:
 				if ac.WarehouseID == nil {
-					return &MissingContextError{Operation: op, Field: "WarehouseID", Reason: "warehouse-scoped model requires warehouse context"}
+					return newMissingContextError(op, "WarehouseID", "warehouse-scoped model requires warehouse context")
 				}
 			case schema.ScopeUser:
 				if ac.UserID == nil {
-					return &MissingContextError{Operation: op, Field: "UserID", Reason: "user-scoped model requires user context"}
+					return newMissingContextError(op, "UserID", "user-scoped model requires user context")
 				}
 			}
 		}
@@ -192,16 +234,16 @@ func validateContextForOperation(ac Context, table *schema.Table, op Operation, 
 			switch {
 			case col.CreatedBy, col.UpdatedBy, col.DeletedBy:
 				if ac.UserID == nil {
-					return &MissingContextError{Operation: op, Field: "UserID", Reason: "audit fields require user context"}
+					return newMissingContextError(op, "UserID", "audit fields require user context")
 				}
 			}
 		case OpUpdate:
 			if col.UpdatedBy && ac.UserID == nil {
-				return &MissingContextError{Operation: op, Field: "UserID", Reason: "updated_by requires user context"}
+				return newMissingContextError(op, "UserID", "updated_by requires user context")
 			}
 		case OpDelete:
 			if col.DeletedBy && ac.UserID == nil {
-				return &MissingContextError{Operation: op, Field: "UserID", Reason: "deleted_by requires user context"}
+				return newMissingContextError(op, "UserID", "deleted_by requires user context")
 			}
 		}
 	}

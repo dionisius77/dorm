@@ -5,7 +5,7 @@ import (
 	"database/sql"
 	"os"
 
-	"github.com/dionisius77/dorm/errkind"
+	dormerrors "github.com/dionisius77/dorm/errors"
 )
 
 type DriftReport struct {
@@ -46,7 +46,7 @@ func DetectDriftFromSource(ctx context.Context, root string, inspector Inspector
 	var report *DriftReport
 	err := traceOperation(ctx, "db.schema.check", func(ctx context.Context) error {
 		if root == "" {
-			return errkind.New(errkind.KindConfiguration, "schema: empty root")
+			return dormerrors.NewValidationError("schema", "root", "empty root", nil)
 		}
 		builder := NewBuilder(root)
 		expected, err := builder.Build(ctx)
@@ -97,7 +97,7 @@ func detectDrift(expected, actual *Schema) (*DriftReport, error) {
 	var report *DriftReport
 	err := traceOperation(context.Background(), "db.schema.check", func(context.Context) error {
 		if expected == nil || actual == nil {
-			return errkind.New(errkind.KindInvalidSchema, "schema: drift detection requires non-nil schemas")
+			return dormerrors.NewSchemaError(dormerrors.KindInvalidSchema, schemaDisplayName(expected), schemaDisplayName(actual), "drift detection requires non-nil schemas", nil)
 		}
 		diff, err := Compare(expected, actual)
 		if err != nil {
@@ -114,6 +114,16 @@ func detectDrift(expected, actual *Schema) (*DriftReport, error) {
 		return nil, err
 	}
 	return report, nil
+}
+
+func schemaDisplayName(s *Schema) string {
+	if s == nil {
+		return "nil"
+	}
+	if s.Name != "" {
+		return s.Name
+	}
+	return "unknown"
 }
 
 func detectDriftWithSnapshot(expected *Schema, snapshot *Snapshot, actual *Schema) (*DriftReport, error) {

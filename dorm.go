@@ -2,16 +2,38 @@ package dorm
 
 import (
 	"context"
+	"fmt"
 	"strings"
 	"sync"
 
 	"github.com/dionisius77/dorm/driver"
 	"github.com/dionisius77/dorm/errkind"
+	dormerrors "github.com/dionisius77/dorm/errors"
 	"github.com/dionisius77/dorm/orm"
 	"github.com/dionisius77/dorm/schema"
 )
 
 type DB = orm.DB
+
+var (
+	ErrNotFound             = dormerrors.ErrNotFound
+	ErrAlreadyExists        = dormerrors.ErrAlreadyExists
+	ErrConflict             = dormerrors.ErrConflict
+	ErrInvalidModel         = dormerrors.ErrInvalidModel
+	ErrInvalidRelationship  = dormerrors.ErrInvalidRelationship
+	ErrMigrationRequired    = dormerrors.ErrMigrationRequired
+	ErrSchemaDrift          = dormerrors.ErrSchemaDrift
+	ErrInvalidContext       = dormerrors.ErrInvalidContext
+	ErrMissingCompany       = dormerrors.ErrMissingCompany
+	ErrPolicyDenied         = dormerrors.ErrPolicyDenied
+	ErrSeedConflict         = dormerrors.ErrSeedConflict
+	ErrDriverNotRegistered  = dormerrors.ErrDriverNotRegistered
+	ErrUnsupportedDialect   = dormerrors.ErrUnsupportedDialect
+	ErrTransactionClosed    = dormerrors.ErrTransactionClosed
+	ErrCommitFailed         = dormerrors.ErrCommitFailed
+	ErrRollbackFailed       = dormerrors.ErrRollbackFailed
+	ErrOptimisticLockFailed = dormerrors.ErrOptimisticLockFailed
+)
 
 type OpenOption func(*openConfig)
 
@@ -50,7 +72,7 @@ func Open(ctx context.Context, drv driver.Driver, opts ...OpenOption) (*DB, erro
 		drv = RegisteredDriver()
 	}
 	if drv == nil {
-		return nil, errkind.New(errkind.KindConfiguration, "dorm: no driver registered")
+		return nil, fmt.Errorf("dorm: no driver registered: %w", dormerrors.ErrDriverNotRegistered)
 	}
 	cfg := openConfig{}
 	for _, opt := range opts {
