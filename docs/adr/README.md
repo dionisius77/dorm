@@ -33,3 +33,4 @@ This directory contains the architectural contract for the ORM.
 - [ADR-027: Error Model & Error Handling](./ADR-027-error-model.md)
 - [ADR-028: Transaction API & Transaction Lifecycle](./ADR-028-transaction-api.md)
 - [ADR-029: Lifecycle Hooks](./ADR-029-lifecycle-hooks.md)
+- [ADR-030: Batch Operations](./ADR-030-batch-operations.md)

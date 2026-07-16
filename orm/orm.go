@@ -18,6 +18,8 @@ import (
 
 var ErrNotFound = dormerrors.ErrNotFound
 
+const defaultBatchSize = 100
+
 var (
 	tableMetaCache sync.Map // map[reflect.Type]*schema.Table
 )
@@ -37,6 +39,7 @@ type Config struct {
 	Access              access.Engine
 	PrepareStatements   bool
 	SoftDeleteByDefault bool
+	BatchSize           int
 }
 
 type DB struct {
@@ -51,6 +54,7 @@ type DB struct {
 	access              access.Engine
 	prepareStatements   bool
 	softDeleteByDefault bool
+	batchSize           int
 	stmtMu              sync.Mutex
 	txMu                sync.Mutex
 	stmts               map[string]*sql.Stmt
@@ -69,6 +73,10 @@ func (s *Session) resolveModel(model any) (*tableMeta, reflect.Value, error) {
 
 func New(cfg Config) *DB {
 	obs := cfg.Observability.Normalized()
+	batchSize := cfg.BatchSize
+	if batchSize <= 0 {
+		batchSize = defaultBatchSize
+	}
 	return &DB{
 		db:                  cfg.DB,
 		tx:                  cfg.Tx,
@@ -81,6 +89,7 @@ func New(cfg Config) *DB {
 		access:              cfg.Access,
 		prepareStatements:   cfg.PrepareStatements,
 		softDeleteByDefault: cfg.SoftDeleteByDefault,
+		batchSize:           batchSize,
 		stmts:               map[string]*sql.Stmt{},
 	}
 }
@@ -213,141 +222,118 @@ func (s *Session) Count(model any, opts ...QueryOption) (int64, error) {
 func (s *Session) Create(model any) error {
 	return s.db.traceOperation(s.ctx, "db.insert", []Attribute{{Key: "orm.operation", Value: "create"}}, func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
-		if err := invokeBeforeCreateHook(ctx, s.db, model); err != nil {
-			return err
-		}
-		meta, rv, err := s.resolveModel(model)
-		if err != nil {
-			return err
-		}
-		now := time.Now().UTC()
-		table := meta.table
-		values := map[string]any{}
-		if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpInsert); err != nil {
-			return err
-		}
-		if err := applyStructFieldValues(ctx, table, rv, values, now, true); err != nil {
-			return err
-		}
-		cols, args := orderedColumnsAndArgs(table, values, true)
-		if len(cols) == 0 {
-			return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: no insertable columns for %s", table.Name))
-		}
-		sqlText, err := s.db.dialect.RenderInsert(table.Name, cols, returningColumns(table))
-		if err != nil {
-			return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render insert", err)
-		}
-		if err := s.db.execReturning(ctx, sqlText, args, model, table); err != nil {
-			return err
-		}
-		return invokeAfterCreateHook(ctx, s.db, model)
+		return s.create(ctx, model)
 	})
 }
 
+func (s *Session) create(ctx context.Context, model any) error {
+	if err := invokeBeforeCreateHook(ctx, s.db, model); err != nil {
+		return err
+	}
+	meta, rv, err := s.resolveModel(model)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	table := meta.table
+	values := map[string]any{}
+	if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpInsert); err != nil {
+		return err
+	}
+	if err := applyStructFieldValues(ctx, table, rv, values, now, true); err != nil {
+		return err
+	}
+	cols, args := orderedColumnsAndArgs(table, values, true)
+	if len(cols) == 0 {
+		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: no insertable columns for %s", table.Name))
+	}
+	sqlText, err := s.db.dialect.RenderInsert(table.Name, cols, returningColumns(table))
+	if err != nil {
+		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render insert", err)
+	}
+	if err := s.db.execReturning(ctx, sqlText, args, model, table); err != nil {
+		return err
+	}
+	return invokeAfterCreateHook(ctx, s.db, model)
+}
+
 func (s *Session) Update(model any) error {
-	return s.update(model, nil, true)
+	return s.db.traceOperation(s.ctx, "db.update", []Attribute{{Key: "orm.operation", Value: "update"}}, func(ctx context.Context) error {
+		s.db.logPolicyOverride(ctx)
+		return s.update(ctx, model, nil, true)
+	})
 }
 
 // UpdateWhere updates rows matching explicit query filters.
 func (s *Session) UpdateWhere(model any, opts ...QueryOption) error {
-	return s.update(model, opts, false)
-}
-
-func (s *Session) update(model any, opts []QueryOption, usePrimaryKey bool) error {
 	return s.db.traceOperation(s.ctx, "db.update", []Attribute{{Key: "orm.operation", Value: "update"}}, func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
-		if err := invokeBeforeUpdateHook(ctx, s.db, model); err != nil {
-			return err
-		}
-		meta, rv, err := s.resolveModel(model)
-		if err != nil {
-			return err
-		}
-		now := time.Now().UTC()
-		table := meta.table
-		values := map[string]any{}
-		if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpUpdate); err != nil {
-			return err
-		}
-		if err := applyStructFieldValues(ctx, table, rv, values, now, false); err != nil {
-			return err
-		}
-		setPkCols := primaryKeyColumnNames(table)
-		set, args := updateSetClauses(table, values, setPkCols, s.db.dialect)
-		if len(set) == 0 {
-			return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: no updatable columns for %s", table.Name))
-		}
-
-		var whereCols []string
-		var whereArgs []any
-		var extraPreds []predicate
-		if usePrimaryKey {
-			whereCols, whereArgs, err = primaryKeyValues(table, rv)
-			if err != nil {
-				return err
-			}
-			if len(whereCols) == 0 {
-				return errkind.New(errkind.KindInvalidSchema, "orm: update requires primary key")
-			}
-			extraPreds = append(extraPreds, accessPredicates(ctx, table)...)
-		} else {
-			state := &queryState{}
-			for _, opt := range opts {
-				opt(state)
-			}
-			if len(state.where) == 0 {
-				return errkind.New(errkind.KindInvalidSchema, "orm: updatewhere requires where clauses")
-			}
-			extraPreds = append(extraPreds, state.where...)
-			extraPreds = append(extraPreds, accessPredicates(ctx, table)...)
-		}
-
-		whereSQL, whereArgs := buildWhereClauses(whereCols, whereArgs, extraPreds, s.db.dialect)
-		sqlText, err := s.db.dialect.RenderUpdate(table.Name, set, whereSQL, returningColumns(table))
-		if err != nil {
-			return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render update", err)
-		}
-		if err := s.db.execReturning(ctx, sqlText, append(args, whereArgs...), model, table); err != nil {
-			return err
-		}
-		return invokeAfterUpdateHook(ctx, s.db, model)
+		return s.update(ctx, model, opts, false)
 	})
+}
+
+func (s *Session) update(ctx context.Context, model any, opts []QueryOption, usePrimaryKey bool) error {
+	if err := invokeBeforeUpdateHook(ctx, s.db, model); err != nil {
+		return err
+	}
+	meta, rv, err := s.resolveModel(model)
+	if err != nil {
+		return err
+	}
+	now := time.Now().UTC()
+	table := meta.table
+	values := map[string]any{}
+	if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpUpdate); err != nil {
+		return err
+	}
+	if err := applyStructFieldValues(ctx, table, rv, values, now, false); err != nil {
+		return err
+	}
+	setPkCols := primaryKeyColumnNames(table)
+	set, args := updateSetClauses(table, values, setPkCols, s.db.dialect)
+	if len(set) == 0 {
+		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: no updatable columns for %s", table.Name))
+	}
+
+	var whereCols []string
+	var whereArgs []any
+	var extraPreds []predicate
+	if usePrimaryKey {
+		whereCols, whereArgs, err = primaryKeyValues(table, rv)
+		if err != nil {
+			return err
+		}
+		if len(whereCols) == 0 {
+			return errkind.New(errkind.KindInvalidSchema, "orm: update requires primary key")
+		}
+		extraPreds = append(extraPreds, accessPredicates(ctx, table)...)
+	} else {
+		state := &queryState{}
+		for _, opt := range opts {
+			opt(state)
+		}
+		if len(state.where) == 0 {
+			return errkind.New(errkind.KindInvalidSchema, "orm: updatewhere requires where clauses")
+		}
+		extraPreds = append(extraPreds, state.where...)
+		extraPreds = append(extraPreds, accessPredicates(ctx, table)...)
+	}
+
+	whereSQL, whereArgs := buildWhereClauses(whereCols, whereArgs, extraPreds, s.db.dialect)
+	sqlText, err := s.db.dialect.RenderUpdate(table.Name, set, whereSQL, returningColumns(table))
+	if err != nil {
+		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render update", err)
+	}
+	if err := s.db.execReturning(ctx, sqlText, append(args, whereArgs...), model, table); err != nil {
+		return err
+	}
+	return invokeAfterUpdateHook(ctx, s.db, model)
 }
 
 func (s *Session) Delete(model any) error {
 	return s.db.traceOperation(s.ctx, "db.delete", []Attribute{{Key: "orm.operation", Value: "delete"}}, func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
-		if err := invokeBeforeDeleteHook(ctx, s.db, model); err != nil {
-			return err
-		}
-		meta, rv, err := s.resolveModel(model)
-		if err != nil {
-			return err
-		}
-		table := meta.table
-		if soft := softDeleteColumn(table); soft != nil && access.PolicyFromContext(ctx).EnforcesSoftDelete() {
-			if err := s.softDelete(model, table, rv, soft); err != nil {
-				return err
-			}
-			return invokeAfterDeleteHook(ctx, s.db, model)
-		}
-		pkCols, pkArgs, err := primaryKeyValues(table, rv)
-		if err != nil {
-			return err
-		}
-		if len(pkCols) == 0 {
-			return errkind.New(errkind.KindInvalidSchema, "orm: delete requires primary key")
-		}
-		whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), s.db.dialect)
-		sqlText, err := s.db.dialect.RenderDelete(table.Name, whereSQL, nil)
-		if err != nil {
-			return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render delete", err)
-		}
-		_, err = s.db.execContext(ctx, sqlText, whereArgs...)
-		if err != nil {
-			return err
-		}
-		return invokeAfterDeleteHook(ctx, s.db, model)
+		return s.delete(ctx, model)
 	})
 }
 
@@ -366,7 +352,7 @@ func (s *Session) SoftDelete(model any) error {
 		if soft == nil {
 			return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: table %s has no soft delete column", table.Name))
 		}
-		if err := s.softDelete(model, table, rv, soft); err != nil {
+		if err := s.softDelete(ctx, model, table, rv, soft); err != nil {
 			return err
 		}
 		return invokeAfterDeleteHook(ctx, s.db, model)
@@ -981,10 +967,10 @@ func softDeleteColumn(table *schema.Table) *schema.Column {
 	return access.SoftDeleteColumn(table)
 }
 
-func (s *Session) softDelete(model any, table *schema.Table, rv reflect.Value, soft *schema.Column) error {
+func (s *Session) softDelete(ctx context.Context, model any, table *schema.Table, rv reflect.Value, soft *schema.Column) error {
 	now := time.Now().UTC()
 	values := map[string]any{}
-	if err := populateAuditAndScope(s.ctx, table, rv, values, now, access.OpDelete); err != nil {
+	if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpDelete); err != nil {
 		return err
 	}
 	values[soft.Name] = now
@@ -993,7 +979,7 @@ func (s *Session) softDelete(model any, table *schema.Table, rv reflect.Value, s
 	if err != nil {
 		return err
 	}
-	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(s.ctx, table), s.db.dialect)
+	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), s.db.dialect)
 	set, args := updateSetClauses(table, values, pkCols, s.db.dialect)
 	if len(set) == 0 {
 		set = []string{s.db.dialect.QuoteIdent(soft.Name) + " = " + s.db.dialect.Placeholder(1)}
@@ -1003,12 +989,62 @@ func (s *Session) softDelete(model any, table *schema.Table, rv reflect.Value, s
 	if err != nil {
 		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render soft delete", err)
 	}
-	_, err = s.db.execContext(s.ctx, sqlText, append(args, whereArgs...)...)
+	_, err = s.db.execContext(ctx, sqlText, append(args, whereArgs...)...)
 	_ = values
 	if err != nil {
 		return errkind.Wrap(errkind.KindRuntimeQuery, "orm: soft delete", err)
 	}
 	return nil
+}
+
+func (s *Session) delete(ctx context.Context, model any) error {
+	if err := invokeBeforeDeleteHook(ctx, s.db, model); err != nil {
+		return err
+	}
+	meta, rv, err := s.resolveModel(model)
+	if err != nil {
+		return err
+	}
+	table := meta.table
+	if soft := softDeleteColumn(table); soft != nil && access.PolicyFromContext(ctx).EnforcesSoftDelete() {
+		if err := s.softDelete(ctx, model, table, rv, soft); err != nil {
+			return err
+		}
+		return invokeAfterDeleteHook(ctx, s.db, model)
+	}
+	pkCols, pkArgs, err := primaryKeyValues(table, rv)
+	if err != nil {
+		return err
+	}
+	if len(pkCols) == 0 {
+		return errkind.New(errkind.KindInvalidSchema, "orm: delete requires primary key")
+	}
+	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), s.db.dialect)
+	sqlText, err := s.db.dialect.RenderDelete(table.Name, whereSQL, nil)
+	if err != nil {
+		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render delete", err)
+	}
+	_, err = s.db.execContext(ctx, sqlText, whereArgs...)
+	if err != nil {
+		return err
+	}
+	return invokeAfterDeleteHook(ctx, s.db, model)
+}
+
+func (db *DB) batchSizeLimit(total int) int {
+	if db == nil || db.batchSize <= 0 {
+		if total <= 0 {
+			return defaultBatchSize
+		}
+		if total < defaultBatchSize {
+			return total
+		}
+		return defaultBatchSize
+	}
+	if total <= 0 || total > db.batchSize {
+		return db.batchSize
+	}
+	return total
 }
 
 func primaryKeyValues(table *schema.Table, rv reflect.Value) ([]string, []any, error) {

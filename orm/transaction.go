@@ -34,6 +34,16 @@ func (db *DB) session() *Session {
 	return &Session{db: db, ctx: db.currentContext()}
 }
 
+func (db *DB) sessionWithContext(ctx context.Context) *Session {
+	if db == nil {
+		return &Session{}
+	}
+	if ctx == nil {
+		ctx = db.currentContext()
+	}
+	return &Session{db: db, ctx: ctx}
+}
+
 func (db *DB) Find(dest any, opts ...QueryOption) error {
 	if db == nil {
 		return errkind.New(errkind.KindConfiguration, "orm: nil db")
@@ -62,11 +72,25 @@ func (db *DB) Create(model any) error {
 	return db.session().Create(model)
 }
 
+func (db *DB) CreateMany(ctx context.Context, models any) error {
+	if db == nil {
+		return errkind.New(errkind.KindConfiguration, "orm: nil db")
+	}
+	return db.sessionWithContext(ctx).CreateMany(models)
+}
+
 func (db *DB) Update(model any) error {
 	if db == nil {
 		return errkind.New(errkind.KindConfiguration, "orm: nil db")
 	}
 	return db.session().Update(model)
+}
+
+func (db *DB) UpdateMany(ctx context.Context, models any) error {
+	if db == nil {
+		return errkind.New(errkind.KindConfiguration, "orm: nil db")
+	}
+	return db.sessionWithContext(ctx).UpdateMany(models)
 }
 
 func (db *DB) UpdateWhere(model any, opts ...QueryOption) error {
@@ -81,6 +105,13 @@ func (db *DB) Delete(model any) error {
 		return errkind.New(errkind.KindConfiguration, "orm: nil db")
 	}
 	return db.session().Delete(model)
+}
+
+func (db *DB) DeleteMany(ctx context.Context, models any) error {
+	if db == nil {
+		return errkind.New(errkind.KindConfiguration, "orm: nil db")
+	}
+	return db.sessionWithContext(ctx).DeleteMany(models)
 }
 
 func (db *DB) SoftDelete(model any) error {
