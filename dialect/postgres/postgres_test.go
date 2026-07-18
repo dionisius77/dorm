@@ -7,7 +7,7 @@ import (
 )
 
 func TestRenderSelect(t *testing.T) {
-	sql, err := New().RenderSelect("products", []string{`"id"`, `"name"`}, []string{`"company_id" = $1`}, []string{`"name" ASC`}, nil, nil)
+	sql, err := New().RenderSelect("products", []string{`"id"`, `"name"`}, false, nil, []string{`"company_id" = $1`}, nil, nil, []string{`"name" ASC`}, nil, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -163,12 +163,12 @@ func (s *Session) DryRun() *DryRunSession {
 }
 
 func (s *Session) Find(dest any, opts ...QueryOption) error {
-	return s.db.traceOperation(s.ctx, "db.query", []Attribute{{Key: "orm.operation", Value: "find"}}, func(ctx context.Context) error {
+	state, err := s.buildState(dest, opts...)
+	if err != nil {
+		return err
+	}
+	return s.db.traceOperation(s.ctx, "db.query", state.traceAttrs("find"), func(ctx context.Context) error {
 		if err := invokeBeforeFindHook(ctx, s.db, beforeFindHookModel(dest)); err != nil {
-			return err
-		}
-		state, err := s.buildState(dest, opts...)
-		if err != nil {
 			return err
 		}
 		sqlText, args, err := s.db.buildSelectSQL(ctx, state)
@@ -202,44 +202,17 @@ func (s *Session) FindOne(dest any, opts ...QueryOption) error {
 // Count returns the number of rows matching the model type and query options.
 func (s *Session) Count(model any, opts ...QueryOption) (int64, error) {
 	var count int64
-	err := s.db.traceOperation(s.ctx, "db.query", []Attribute{{Key: "orm.operation", Value: "count"}}, func(ctx context.Context) error {
+	state, err := s.countState(model, opts...)
+	if err != nil {
+		return 0, err
+	}
+	err = s.db.traceOperation(s.ctx, "db.query", state.traceAttrs("count"), func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
-		meta, _, err := s.db.resolveModel(model)
+		sqlText, args, err := s.db.buildSelectSQL(ctx, state)
 		if err != nil {
 			return err
 		}
-		if s.db.dryRun != nil {
-			s.db.dryRun.setTable(meta.table.Name)
-			s.db.dryRun.setOperation("count")
-		}
-		state := &queryState{table: meta.table}
-		if s.withDeleted {
-			state.withDeleted = true
-		}
-		for _, opt := range opts {
-			opt(state)
-		}
-		if !state.withDeleted && access.PolicyFromContext(s.ctx).EnforcesSoftDelete() && softDeleteColumn(meta.table) != nil {
-			state.where = append(state.where, predicate{expr: softDeleteColumn(meta.table).Name + " IS NULL"})
-		}
-		preds, _, err := s.db.access.Apply(s.ctx, meta.table, access.OpQuery, nil)
-		if err != nil {
-			return err
-		}
-		for _, pred := range preds {
-			state.where = append(state.where, predicate{expr: pred.SQL, args: pred.Args})
-		}
-		var clauses []string
-		var args []any
-		for _, p := range state.where {
-			clause, clauseArgs := bindClause(p.expr, p.args, len(args)+1, s.db.dialect)
-			clauses = append(clauses, clause)
-			args = append(args, clauseArgs...)
-		}
-		sqlText, err := s.db.dialect.RenderSelect(meta.table.Name, []string{"COUNT(*)"}, clauses, nil, nil, nil)
-		if err != nil {
-			return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render count", err)
-		}
+		sqlText = "SELECT COUNT(*) FROM (" + sqlText + ") AS orm_count"
 		rows, err := s.db.queryContext(ctx, sqlText, args...)
 		if err != nil {
 			return err
@@ -257,6 +230,34 @@ func (s *Session) Count(model any, opts ...QueryOption) (int64, error) {
 		return 0, err
 	}
 	return count, nil
+}
+
+// Exists reports whether any row matches the query options.
+func (s *Session) Exists(model any, opts ...QueryOption) (bool, error) {
+	state, err := s.countState(model, opts...)
+	if err != nil {
+		return false, err
+	}
+	var exists bool
+	err = s.db.traceOperation(s.ctx, "db.query", state.traceAttrs("exists"), func(ctx context.Context) error {
+		s.db.logPolicyOverride(ctx)
+		sqlText, args, err := s.db.buildSelectSQL(ctx, state)
+		if err != nil {
+			return err
+		}
+		sqlText = "SELECT 1 FROM (" + sqlText + ") AS orm_exists LIMIT 1"
+		rows, err := s.db.queryContext(ctx, sqlText, args...)
+		if err != nil {
+			return err
+		}
+		defer rows.Close()
+		exists = rows.Next()
+		return rows.Err()
+	})
+	if err != nil {
+		return false, err
+	}
+	return exists, nil
 }
 
 func (s *Session) Create(model any) error {
@@ -566,43 +567,182 @@ func (db *DB) Close() error {
 
 type QueryOption func(*queryState)
 
-func Where(expr string, args ...any) QueryOption {
+func Select(expr string) QueryOption {
+	expr = strings.TrimSpace(expr)
 	return func(q *queryState) {
+		if q == nil {
+			return
+		}
+		if expr == "" {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: select requires a non-empty expression")
+			return
+		}
+		q.selectColumns = []string{expr}
+	}
+}
+
+func Distinct() QueryOption {
+	return func(q *queryState) {
+		if q != nil {
+			q.distinct = true
+		}
+	}
+}
+
+func Where(expr string, args ...any) QueryOption {
+	expr = strings.TrimSpace(expr)
+	return func(q *queryState) {
+		if q == nil {
+			return
+		}
+		if expr == "" {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: where requires a non-empty expression")
+			return
+		}
 		q.where = append(q.where, predicate{expr: expr, args: args})
 	}
 }
 
-func OrderBy(expr string) QueryOption {
+func LeftJoin(table, on string, args ...any) QueryOption {
+	return joinOption("LEFT JOIN", table, on, args...)
+}
+
+func RightJoin(table, on string, args ...any) QueryOption {
+	return joinOption("RIGHT JOIN", table, on, args...)
+}
+
+func InnerJoin(table, on string, args ...any) QueryOption {
+	return joinOption("INNER JOIN", table, on, args...)
+}
+
+func CrossJoin(table string) QueryOption {
+	table = strings.TrimSpace(table)
 	return func(q *queryState) {
+		if q == nil {
+			return
+		}
+		if table == "" {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: cross join requires a non-empty table")
+			return
+		}
+		q.joins = append(q.joins, joinClause{kind: "CROSS JOIN", table: table})
+	}
+}
+
+func GroupBy(expr string) QueryOption {
+	expr = strings.TrimSpace(expr)
+	return func(q *queryState) {
+		if q == nil {
+			return
+		}
+		if expr == "" {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: group by requires a non-empty expression")
+			return
+		}
+		q.groupBy = append(q.groupBy, expr)
+	}
+}
+
+func Having(expr string, args ...any) QueryOption {
+	expr = strings.TrimSpace(expr)
+	return func(q *queryState) {
+		if q == nil {
+			return
+		}
+		if expr == "" {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: having requires a non-empty expression")
+			return
+		}
+		q.having = append(q.having, predicate{expr: expr, args: args})
+	}
+}
+
+func OrderBy(expr string) QueryOption {
+	expr = strings.TrimSpace(expr)
+	return func(q *queryState) {
+		if q == nil {
+			return
+		}
+		if expr == "" {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: order by requires a non-empty expression")
+			return
+		}
 		q.orderBy = append(q.orderBy, expr)
 	}
 }
 
 func Limit(n int) QueryOption {
 	return func(q *queryState) {
+		if q == nil {
+			return
+		}
+		if n < 0 {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: limit must be non-negative")
+			return
+		}
 		q.limit = &n
 	}
 }
 
 func Offset(n int) QueryOption {
 	return func(q *queryState) {
+		if q == nil {
+			return
+		}
+		if n < 0 {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: offset must be non-negative")
+			return
+		}
 		q.offset = &n
 	}
 }
 
 type queryState struct {
-	table       *schema.Table
-	columns     []string
-	where       []predicate
-	orderBy     []string
-	limit       *int
-	offset      *int
-	withDeleted bool
+	table        *schema.Table
+	columns      []string
+	selectColumns []string
+	distinct     bool
+	joins        []joinClause
+	where        []predicate
+	groupBy      []string
+	having       []predicate
+	orderBy      []string
+	limit        *int
+	offset       *int
+	withDeleted  bool
+	err          error
 }
 
 type predicate struct {
 	expr string
 	args []any
+}
+
+type joinClause struct {
+	kind  string
+	table string
+	on    string
+	args  []any
+}
+
+func joinOption(kind, table, on string, args ...any) QueryOption {
+	kind = strings.TrimSpace(kind)
+	table = strings.TrimSpace(table)
+	on = strings.TrimSpace(on)
+	return func(q *queryState) {
+		if q == nil {
+			return
+		}
+		if kind == "" || table == "" {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: join requires a non-empty table")
+			return
+		}
+		if kind != "CROSS JOIN" && on == "" {
+			q.err = errkind.New(errkind.KindConfiguration, "orm: join requires a non-empty join condition")
+			return
+		}
+		q.joins = append(q.joins, joinClause{kind: kind, table: table, on: on, args: append([]any(nil), args...)})
+	}
 }
 
 func (s *Session) buildState(dest any, opts ...QueryOption) (*queryState, error) {
@@ -620,7 +760,13 @@ func (s *Session) buildState(dest any, opts ...QueryOption) (*queryState, error)
 		state.withDeleted = true
 	}
 	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
 		opt(state)
+		if state.err != nil {
+			return nil, state.err
+		}
 	}
 	if !state.withDeleted && access.PolicyFromContext(s.ctx).EnforcesSoftDelete() && softDeleteColumn(meta.table) != nil {
 		soft := softDeleteColumn(meta.table)
@@ -648,18 +794,106 @@ func (s *Session) buildState(dest any, opts ...QueryOption) (*queryState, error)
 }
 
 func (db *DB) buildSelectSQL(ctx context.Context, state *queryState) (string, []any, error) {
+	if state == nil {
+		return "", nil, errkind.New(errkind.KindConfiguration, "orm: nil query state")
+	}
 	var clauses []string
 	var args []any
+	columns := state.selectColumns
+	if len(columns) == 0 {
+		columns = quoteColumns(state.columns, db.dialect)
+	}
+	joins := make([]string, 0, len(state.joins))
+	for _, j := range state.joins {
+		joinSQL := strings.TrimSpace(j.kind) + " " + strings.TrimSpace(j.table)
+		if strings.TrimSpace(j.on) != "" && j.kind != "CROSS JOIN" {
+			onClause, onArgs := bindClause(j.on, j.args, len(args)+1, db.dialect)
+			joinSQL += " ON " + onClause
+			args = append(args, onArgs...)
+		}
+		joins = append(joins, joinSQL)
+	}
 	for _, p := range state.where {
 		clause, clauseArgs := bindClause(p.expr, p.args, len(args)+1, db.dialect)
 		clauses = append(clauses, clause)
 		args = append(args, clauseArgs...)
 	}
-	sqlText, err := db.dialect.RenderSelect(state.table.Name, quoteColumns(state.columns, db.dialect), clauses, state.orderBy, state.limit, state.offset)
+	groupBy := make([]string, 0, len(state.groupBy))
+	for _, expr := range state.groupBy {
+		groupBy = append(groupBy, expr)
+	}
+	having := make([]string, 0, len(state.having))
+	for _, p := range state.having {
+		clause, clauseArgs := bindClause(p.expr, p.args, len(args)+1, db.dialect)
+		having = append(having, clause)
+		args = append(args, clauseArgs...)
+	}
+	sqlText, err := db.dialect.RenderSelect(state.table.Name, columns, state.distinct, joins, clauses, groupBy, having, state.orderBy, state.limit, state.offset)
 	if err != nil {
 		return "", nil, errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render select", err)
 	}
 	return sqlText, args, nil
+}
+
+func (s *Session) countState(model any, opts ...QueryOption) (*queryState, error) {
+	if s == nil || s.db == nil {
+		return nil, errkind.New(errkind.KindConfiguration, "orm: nil session")
+	}
+	meta, _, err := s.db.resolveModel(model)
+	if err != nil {
+		return nil, err
+	}
+	state := &queryState{table: meta.table, columns: columnsForTable(meta.table)}
+	for _, opt := range opts {
+		if opt == nil {
+			continue
+		}
+		opt(state)
+		if state.err != nil {
+			return nil, state.err
+		}
+	}
+	if state.limit != nil || state.offset != nil {
+		state.limit = nil
+		state.offset = nil
+	}
+	if !state.withDeleted && access.PolicyFromContext(s.ctx).EnforcesSoftDelete() && softDeleteColumn(state.table) != nil {
+		state.where = append(state.where, predicate{expr: softDeleteColumn(state.table).Name + " IS NULL"})
+	}
+	preds, _, err := s.db.access.Apply(s.ctx, state.table, access.OpQuery, nil)
+	if err != nil {
+		return nil, err
+	}
+	for _, pred := range preds {
+		state.where = append(state.where, predicate{expr: pred.SQL, args: pred.Args})
+	}
+	return state, nil
+}
+
+func (s *queryState) traceAttrs(operation string) []Attribute {
+	if s == nil {
+		return []Attribute{{Key: "orm.operation", Value: operation}}
+	}
+	attrs := []Attribute{{Key: "orm.operation", Value: operation}}
+	attrs = append(attrs,
+		Attribute{Key: "orm.query.option_count", Value: s.optionCount()},
+		Attribute{Key: "orm.query.join_count", Value: len(s.joins)},
+		Attribute{Key: "orm.query.where_count", Value: len(s.where)},
+		Attribute{Key: "orm.query.group_by_count", Value: len(s.groupBy)},
+		Attribute{Key: "orm.query.having_count", Value: len(s.having)},
+		Attribute{Key: "orm.query.distinct", Value: s.distinct},
+	)
+	if len(s.selectColumns) > 0 {
+		attrs = append(attrs, Attribute{Key: "orm.query.select_count", Value: len(s.selectColumns)})
+	}
+	return attrs
+}
+
+func (s *queryState) optionCount() int {
+	if s == nil {
+		return 0
+	}
+	return len(s.selectColumns) + len(s.joins) + len(s.where) + len(s.groupBy) + len(s.having) + len(s.orderBy)
 }
 
 func (db *DB) resolveDest(dest any) (*tableMeta, error) {

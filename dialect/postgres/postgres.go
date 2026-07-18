@@ -319,7 +319,7 @@ func tablePrimaryKeyColumns(table *schema.Table) []string {
 	return cols
 }
 
-func (d Dialect) RenderSelect(table string, columns []string, where []string, orderBy []string, limit, offset *int) (string, error) {
+func (d Dialect) RenderSelect(table string, columns []string, distinct bool, joins []string, where []string, groupBy []string, having []string, orderBy []string, limit, offset *int) (string, error) {
 	if table == "" {
 		return "", fmt.Errorf("postgres: empty table")
 	}
@@ -328,12 +328,27 @@ func (d Dialect) RenderSelect(table string, columns []string, where []string, or
 	}
 	var b strings.Builder
 	b.WriteString("SELECT ")
+	if distinct {
+		b.WriteString("DISTINCT ")
+	}
 	b.WriteString(strings.Join(columns, ", "))
 	b.WriteString(" FROM ")
 	b.WriteString(d.QuoteIdent(table))
+	if len(joins) > 0 {
+		b.WriteByte(' ')
+		b.WriteString(strings.Join(joins, " "))
+	}
 	if len(where) > 0 {
 		b.WriteString(" WHERE ")
 		b.WriteString(strings.Join(where, " AND "))
+	}
+	if len(groupBy) > 0 {
+		b.WriteString(" GROUP BY ")
+		b.WriteString(strings.Join(groupBy, ", "))
+	}
+	if len(having) > 0 {
+		b.WriteString(" HAVING ")
+		b.WriteString(strings.Join(having, " AND "))
 	}
 	if len(orderBy) > 0 {
 		b.WriteString(" ORDER BY ")

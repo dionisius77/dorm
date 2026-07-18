@@ -20,7 +20,7 @@ func (placeholderDialect) Capabilities() dialect.Capabilities               { re
 func (placeholderDialect) ColumnDefinition(*schema.Column) (string, error)  { return "", nil }
 func (placeholderDialect) RenderOperation(schema.Operation) (string, error) { return "", nil }
 func (placeholderDialect) RenderMigration(*schema.Diff) ([]string, error)   { return nil, nil }
-func (placeholderDialect) RenderSelect(table string, columns []string, where []string, orderBy []string, limit, offset *int) (string, error) {
+func (placeholderDialect) RenderSelect(table string, columns []string, distinct bool, joins []string, where []string, groupBy []string, having []string, orderBy []string, limit, offset *int) (string, error) {
 	return "", nil
 }
 func (placeholderDialect) RenderInsert(table string, columns []string, returning []string) (string, error) {

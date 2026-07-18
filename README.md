@@ -297,6 +297,22 @@ err = db.Update(ctx, &product)
 err = db.Delete(ctx, &product)
 ```
 
+## Query Composition
+
+Query modifiers are passed as `QueryOption`s and composed in SQL order by the ORM.
+
+```go
+err := db.WithContext(ctx).Find(
+    &users,
+    orm.Select("users.id, users.name"),
+    orm.LeftJoin("roles r", "r.id = users.role_id"),
+    orm.Where("users.status = ?", status),
+    orm.OrderBy("users.created_at DESC"),
+    orm.Limit(20),
+    orm.Offset(40),
+)
+```
+
 ---
 
 # Access Policy

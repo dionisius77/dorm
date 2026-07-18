@@ -281,7 +281,7 @@ func (rawTestPlaceholderDialect) Capabilities() dialect.Capabilities {
 func (rawTestPlaceholderDialect) ColumnDefinition(*schema.Column) (string, error)  { return "", nil }
 func (rawTestPlaceholderDialect) RenderOperation(schema.Operation) (string, error) { return "", nil }
 func (rawTestPlaceholderDialect) RenderMigration(*schema.Diff) ([]string, error)   { return nil, nil }
-func (rawTestPlaceholderDialect) RenderSelect(string, []string, []string, []string, *int, *int) (string, error) {
+func (rawTestPlaceholderDialect) RenderSelect(string, []string, bool, []string, []string, []string, []string, []string, *int, *int) (string, error) {
 	return "", nil
 }
 func (rawTestPlaceholderDialect) RenderInsert(string, []string, []string) (string, error) {

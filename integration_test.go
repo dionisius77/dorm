@@ -205,6 +205,25 @@ func TestIntegrationORMHappyPaths(t *testing.T) {
 		t.Fatalf("expected paginated role query to return USER, got %#v", page)
 	}
 
+	var queryOptions []Product
+	if err := db.WithContext(ctxA).Find(&queryOptions,
+		orm.Select("products.id, products.company_id, products.sku, products.name, products.price_cents, products.deleted_at, products.created_at, products.created_by, products.updated_at, products.updated_by, products.deleted_by"),
+		orm.Distinct(),
+		orm.LeftJoin("roles r", "r.id = products.id"),
+		orm.Where("products.price_cents >= ?", 150),
+		orm.OrderBy("products.price_cents DESC"),
+		orm.Limit(2),
+		orm.Offset(0),
+	); err != nil {
+		t.Fatalf("query options integration query: %v", err)
+	}
+	if len(queryOptions) != 2 {
+		t.Fatalf("expected two rows from query options query, got %#v", queryOptions)
+	}
+	if got := skus(queryOptions); !equalStrings(got, []string{"SKU-004", "SKU-002"}) {
+		t.Fatalf("unexpected query options rows: %v", got)
+	}
+
 	if err := db.WithContext(ctxA).Delete(&p1); err != nil {
 		t.Fatalf("delete product: %v", err)
 	}

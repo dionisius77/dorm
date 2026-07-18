@@ -18,7 +18,7 @@ func (placeholderTestDialect) ColumnDefinition(*schema.Column) (string, error) {
 }
 func (placeholderTestDialect) RenderOperation(schema.Operation) (string, error) { return "", nil }
 func (placeholderTestDialect) RenderMigration(*schema.Diff) ([]string, error)   { return nil, nil }
-func (placeholderTestDialect) RenderSelect(string, []string, []string, []string, *int, *int) (string, error) {
+func (placeholderTestDialect) RenderSelect(string, []string, bool, []string, []string, []string, []string, []string, *int, *int) (string, error) {
 	return "", nil
 }
 func (placeholderTestDialect) RenderInsert(string, []string, []string) (string, error) {

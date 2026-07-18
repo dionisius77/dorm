@@ -172,7 +172,7 @@ func (s *Session) loadBelongsToRelation(parent, relationField reflect.Value, rel
 	where := []string{s.db.dialect.QuoteIdent(pkCols[0]) + " = " + s.db.dialect.Placeholder(1)}
 	args := []any{fkField.Interface()}
 	where, args = appendAccessWhere(where, args, accessPredicates(s.ctx, targetTable), s.db.dialect)
-	sqlText, err := s.db.dialect.RenderSelect(targetTable.Name, quoteColumns(columnsForTable(targetTable), s.db.dialect), where, nil, nil, nil)
+	sqlText, err := s.db.dialect.RenderSelect(targetTable.Name, quoteColumns(columnsForTable(targetTable), s.db.dialect), false, nil, where, nil, nil, nil, nil, nil)
 	if err != nil {
 		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render relation load", err)
 	}
@@ -235,7 +235,7 @@ func (s *Session) loadHasManyRelation(parent, relationField reflect.Value, relat
 	where := []string{s.db.dialect.QuoteIdent(fkName) + " = " + s.db.dialect.Placeholder(1)}
 	args := []any{parentPKField.Interface()}
 	where, args = appendAccessWhere(where, args, accessPredicates(s.ctx, childTable), s.db.dialect)
-	sqlText, err := s.db.dialect.RenderSelect(childTable.Name, quoteColumns(columnsForTable(childTable), s.db.dialect), where, nil, nil, nil)
+	sqlText, err := s.db.dialect.RenderSelect(childTable.Name, quoteColumns(columnsForTable(childTable), s.db.dialect), false, nil, where, nil, nil, nil, nil, nil)
 	if err != nil {
 		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render relation load", err)
 	}
@@ -473,7 +473,7 @@ func primaryKeyField(rv reflect.Value, table *schema.Table) (reflect.Value, bool
 
 func (s *Session) queryOneInto(target any, table *schema.Table, where []string, args ...any) error {
 	where, args = appendAccessWhere(where, args, accessPredicates(s.ctx, table), s.db.dialect)
-	sqlText, err := s.db.dialect.RenderSelect(table.Name, quoteColumns(columnsForTable(table), s.db.dialect), where, nil, nil, nil)
+	sqlText, err := s.db.dialect.RenderSelect(table.Name, quoteColumns(columnsForTable(table), s.db.dialect), false, nil, where, nil, nil, nil, nil, nil)
 	if err != nil {
 		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render query", err)
 	}

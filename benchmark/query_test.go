@@ -28,7 +28,7 @@ func BenchmarkQueryGeneration(b *testing.B) {
 	b.Run("Select", func(b *testing.B) {
 		b.ResetTimer()
 		for i := 0; i < b.N; i++ {
-			if _, err := d.RenderSelect("users", columns, where, orderBy, &limit, &offset); err != nil {
+			if _, err := d.RenderSelect("users", columns, false, nil, where, nil, nil, orderBy, &limit, &offset); err != nil {
 				b.Fatal(err)
 			}
 		}

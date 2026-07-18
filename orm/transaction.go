@@ -65,6 +65,13 @@ func (db *DB) Count(model any, opts ...QueryOption) (int64, error) {
 	return db.session().Count(model, opts...)
 }
 
+func (db *DB) Exists(model any, opts ...QueryOption) (bool, error) {
+	if db == nil {
+		return false, errkind.New(errkind.KindConfiguration, "orm: nil db")
+	}
+	return db.session().Exists(model, opts...)
+}
+
 func (db *DB) Create(model any) error {
 	if db == nil {
 		return errkind.New(errkind.KindConfiguration, "orm: nil db")

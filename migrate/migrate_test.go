@@ -97,7 +97,7 @@ func (failingDialect) RenderOperation(schema.Operation) (string, error) { return
 func (failingDialect) RenderMigration(*schema.Diff) ([]string, error) {
 	return nil, fmt.Errorf("render migration unsupported")
 }
-func (failingDialect) RenderSelect(table string, columns []string, where []string, orderBy []string, limit, offset *int) (string, error) {
+func (failingDialect) RenderSelect(table string, columns []string, distinct bool, joins []string, where []string, groupBy []string, having []string, orderBy []string, limit, offset *int) (string, error) {
 	return "", nil
 }
 func (failingDialect) RenderInsert(table string, columns []string, returning []string) (string, error) {
