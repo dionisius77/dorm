@@ -178,6 +178,12 @@ func columnFromReflectField(field reflect.StructField, traitStack []string) *Col
 	if tagMap["deleted_by"].IsSet || hasTrait(traitStack, "Audit") && strings.EqualFold(field.Name, "DeletedBy") {
 		col.DeletedBy = true
 	}
+	if tagMap["version"].IsSet || hasTrait(traitStack, "Version") && strings.EqualFold(field.Name, "Version") {
+		col.Version = true
+		col.Type = Type{Name: "bigint", Kind: TypeInt}
+		col.Nullable = false
+		col.Default = "1"
+	}
 	if tagMap["company"].IsSet || hasTrait(traitStack, "Company") && strings.EqualFold(field.Name, "CompanyID") {
 		col.Scope = ScopeCompany
 	}
@@ -235,6 +241,11 @@ func columnFromReflectField(field reflect.StructField, traitStack []string) *Col
 		if col.Type.Name == "" {
 			col.Type.Name = "jsonb"
 		}
+	}
+	if col.Version {
+		col.Type = Type{Name: "bigint", Kind: TypeInt}
+		col.Nullable = false
+		col.Default = "1"
 	}
 	if tagMap["pk"].IsSet && tagMap["nullable"].IsSet {
 		col.Nullable = false

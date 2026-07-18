@@ -48,6 +48,7 @@ type Column struct {
 	CreatedBy     bool
 	UpdatedBy     bool
 	DeletedBy     bool
+	Version       bool
 	Scope         ScopeKind
 	Tags          map[string]string
 }

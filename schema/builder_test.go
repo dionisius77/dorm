@@ -161,9 +161,14 @@ type Audit struct {
     DeletedBy string
 }
 
+type Version struct {
+    Version int64
+}
+
 type Entity struct {
     Company
     Audit
+    Version
 }
 
 type Invoice struct {
@@ -195,6 +200,7 @@ type Invoice struct {
 		"deleted_at": {flags: func(c *schema.Column) bool { return c.DeletedAt }},
 		"deleted_by": {flags: func(c *schema.Column) bool { return c.DeletedBy }},
 		"number":     {},
+		"version":    {flags: func(c *schema.Column) bool { return c.Version && c.Default == "1" }},
 		"id":         {flags: func(c *schema.Column) bool { return c.PrimaryKey }},
 	}
 	for name, check := range want {
@@ -227,6 +233,7 @@ import (
 
 type Invoice struct {
     model.Entity
+    model.Version
     ID string ` + "`orm:\"pk\"`" + `
     Number string
 }
@@ -252,6 +259,7 @@ type Invoice struct {
 		"deleted_by": func(c *schema.Column) bool { return c.DeletedBy },
 		"id":         func(c *schema.Column) bool { return c.PrimaryKey },
 		"number":     func(c *schema.Column) bool { return true },
+		"version":    func(c *schema.Column) bool { return c.Version && c.Default == "1" },
 	}
 	for name, check := range want {
 		var found *schema.Column

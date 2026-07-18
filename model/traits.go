@@ -17,6 +17,11 @@ type Audit struct {
 	DeletedBy string
 }
 
+// Version marks a model with optimistic-locking metadata.
+type Version struct {
+	Version int64
+}
+
 // Entity is the common managed model trait.
 type Entity struct {
 	Company

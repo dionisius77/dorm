@@ -16,18 +16,19 @@ const (
 
 // ExecutionReport captures the observable behavior of an ORM operation.
 type ExecutionReport struct {
-	Version         int
-	Operation       string
-	Table           string
-	SQL             string
-	Parameters      []any
-	Statements      []ExecutionStatement
-	AccessPolicies  []AccessPolicyEvent
-	AuditActions    []AuditAction
-	LifecycleHooks  []LifecycleHookEvent
-	QueryAdvisor    []QueryAdvisorFinding
-	ExecutionStatus ExecutionStatus
-	Metadata        map[string]any
+	Version           int
+	Operation         string
+	Table             string
+	SQL               string
+	Parameters        []any
+	Statements        []ExecutionStatement
+	AccessPolicies    []AccessPolicyEvent
+	AuditActions      []AuditAction
+	LifecycleHooks    []LifecycleHookEvent
+	QueryAdvisor      []QueryAdvisorFinding
+	OptimisticLocking *OptimisticLockingInfo
+	ExecutionStatus   ExecutionStatus
+	Metadata          map[string]any
 }
 
 // ExecutionStatement captures a single generated SQL statement.
@@ -99,6 +100,15 @@ type QueryAdvisorReport struct {
 	SQL      string
 	Kind     string
 	Findings []QueryAdvisorFinding
+}
+
+// OptimisticLockingInfo describes optimistic-lock metadata for inspection and tracing.
+type OptimisticLockingInfo struct {
+	Enabled  bool
+	Column   string
+	Current  any
+	Next     any
+	Conflict bool
 }
 
 // QueryAdvisor evaluates a generated statement and returns advisory findings.

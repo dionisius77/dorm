@@ -16,10 +16,10 @@ func (placeholderDialect) QuoteIdent(s string) string {
 func (placeholderDialect) Placeholder(i int) string {
 	return "@" + itoa(i)
 }
-func (placeholderDialect) Capabilities() dialect.Capabilities { return dialect.Capabilities{} }
-func (placeholderDialect) ColumnDefinition(*schema.Column) (string, error) { return "", nil }
+func (placeholderDialect) Capabilities() dialect.Capabilities               { return dialect.Capabilities{} }
+func (placeholderDialect) ColumnDefinition(*schema.Column) (string, error)  { return "", nil }
 func (placeholderDialect) RenderOperation(schema.Operation) (string, error) { return "", nil }
-func (placeholderDialect) RenderMigration(*schema.Diff) ([]string, error) { return nil, nil }
+func (placeholderDialect) RenderMigration(*schema.Diff) ([]string, error)   { return nil, nil }
 func (placeholderDialect) RenderSelect(table string, columns []string, where []string, orderBy []string, limit, offset *int) (string, error) {
 	return "", nil
 }
@@ -37,7 +37,7 @@ func TestBuildWhereClausesUsesDialectQuotingAndPlaceholders(t *testing.T) {
 	cols := []string{"company_id", "user_id"}
 	where, args := buildWhereClauses(cols, []any{"company-1", "user-1"}, []predicate{
 		{expr: "name = ? AND deleted_at IS NULL", args: []any{"alice"}},
-	}, placeholderDialect{})
+	}, 3, placeholderDialect{})
 	if len(where) != 3 {
 		t.Fatalf("expected 3 clauses, got %d", len(where))
 	}

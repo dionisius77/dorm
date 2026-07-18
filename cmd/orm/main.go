@@ -983,6 +983,21 @@ func formatDryRunReport(report dorm.ExecutionReport) string {
 			}
 		}
 	}
+	writeDryRunSection(&b, "Optimistic Locking")
+	if report.OptimisticLocking == nil || !report.OptimisticLocking.Enabled {
+		fmt.Fprintln(&b, "(none)")
+	} else {
+		fmt.Fprintf(&b, "✓ %s enabled\n", report.OptimisticLocking.Column)
+		if report.OptimisticLocking.Current != nil {
+			fmt.Fprintf(&b, "current = %v\n", report.OptimisticLocking.Current)
+		}
+		if report.OptimisticLocking.Next != nil {
+			fmt.Fprintf(&b, "next = %v\n", report.OptimisticLocking.Next)
+		}
+		if report.OptimisticLocking.Conflict {
+			fmt.Fprintln(&b, "⚠ conflict detected")
+		}
+	}
 	writeDryRunSection(&b, "Execution")
 	if report.ExecutionStatus == "" {
 		fmt.Fprintln(&b, string(dorm.ExecutionStatusSkipped))

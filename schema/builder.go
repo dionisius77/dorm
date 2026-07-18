@@ -268,6 +268,12 @@ func buildColumn(goName string, field *ast.Field, table *Table, traitStack []str
 	if meta["deleted_by"].IsSet || hasTrait(traitStack, "Audit") && strings.EqualFold(goName, "DeletedBy") {
 		col.DeletedBy = true
 	}
+	if meta["version"].IsSet || hasTrait(traitStack, "Version") && strings.EqualFold(goName, "Version") {
+		col.Version = true
+		col.Type = Type{Name: "bigint", Kind: TypeInt}
+		col.Nullable = false
+		col.Default = "1"
+	}
 	if meta["company"].IsSet || hasTrait(traitStack, "Company") && strings.EqualFold(goName, "CompanyID") {
 		col.Scope = ScopeCompany
 	}
@@ -336,6 +342,11 @@ func buildColumn(goName string, field *ast.Field, table *Table, traitStack []str
 	if meta["json"].IsSet {
 		col.Type.Kind = TypeJSON
 		col.Type.Name = "jsonb"
+	}
+	if col.Version {
+		col.Type = Type{Name: "bigint", Kind: TypeInt}
+		col.Nullable = false
+		col.Default = "1"
 	}
 	if meta["array"].IsSet {
 		col.Type.Kind = TypeArray

@@ -9,6 +9,7 @@ import (
 
 	"github.com/dionisius77/dorm/access"
 	"github.com/dionisius77/dorm/dialect/postgres"
+	"github.com/dionisius77/dorm/model"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -22,6 +23,7 @@ type dryRunTestUser struct {
 	CreatedBy string
 	UpdatedAt time.Time
 	UpdatedBy string
+	model.Version
 }
 
 func (u *dryRunTestUser) BeforeFind(context.Context) error { return nil }
@@ -175,6 +177,39 @@ func TestDryRunObservabilityUsesInspectionSpans(t *testing.T) {
 	}
 }
 
+func TestDryRunUpdateReportsOptimisticLocking(t *testing.T) {
+	db := dryRunTestDB(t, nil, &rawTestTracerProvider{})
+	ctx := access.WithContext(context.Background(), access.Context{
+		CompanyID: "company-1",
+		UserID:    "user-1",
+		TenantID:  "tenant-1",
+	})
+	user := &dryRunTestUser{
+		ID:      "user-1",
+		Name:    "Alice",
+		Version: model.Version{Version: 3},
+	}
+	report, err := db.WithContext(ctx).DryRun().Update(ctx, user)
+	if err != nil {
+		t.Fatalf("dry run update: %v", err)
+	}
+	if report.OptimisticLocking == nil || !report.OptimisticLocking.Enabled {
+		t.Fatalf("expected optimistic locking metadata, got %#v", report.OptimisticLocking)
+	}
+	if report.OptimisticLocking.Current != int64(3) {
+		t.Fatalf("expected current version 3, got %#v", report.OptimisticLocking.Current)
+	}
+	if report.OptimisticLocking.Next != int64(4) {
+		t.Fatalf("expected next version 4, got %#v", report.OptimisticLocking.Next)
+	}
+	if !strings.Contains(strings.ToLower(report.SQL), `"version" = "version" + 1`) {
+		t.Fatalf("expected version increment in SQL, got %q", report.SQL)
+	}
+	if !strings.Contains(strings.ToLower(report.SQL), `"version" = $`) {
+		t.Fatalf("expected version predicate in SQL, got %q", report.SQL)
+	}
+}
+
 func dryRunTestDB(t *testing.T, advisor QueryAdvisor, tracer TracerProvider) *DB {
 	t.Helper()
 	table := &schema.Table{
@@ -190,6 +225,7 @@ func dryRunTestDB(t *testing.T, advisor QueryAdvisor, tracer TracerProvider) *DB
 			{Name: "created_by", CreatedBy: true},
 			{Name: "updated_at", UpdatedAt: true},
 			{Name: "updated_by", UpdatedBy: true},
+			{Name: "version", Version: true},
 		},
 	}
 	return New(Config{

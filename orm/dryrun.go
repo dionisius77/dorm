@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"strings"
 	"sync"
 	"sync/atomic"
 
@@ -36,6 +37,8 @@ type dryRunConn struct {
 
 type dryRunRows struct {
 	cols []string
+	data [][]driver.Value
+	idx  int
 }
 
 type dryRunResult struct{}
@@ -202,6 +205,16 @@ func (r *dryRunRecorder) recordAdvisor(findings []QueryAdvisorFinding) {
 	r.report.QueryAdvisor = append(r.report.QueryAdvisor, cp...)
 }
 
+func (r *dryRunRecorder) recordOptimisticLock(info *OptimisticLockingInfo) {
+	if r == nil || info == nil {
+		return
+	}
+	cp := *info
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.report.OptimisticLocking = &cp
+}
+
 func (r *dryRunRecorder) finalize() ExecutionReport {
 	if r == nil {
 		return ExecutionReport{ExecutionStatus: ExecutionStatusSkipped}
@@ -215,6 +228,10 @@ func (r *dryRunRecorder) finalize() ExecutionReport {
 	report.AuditActions = append([]AuditAction(nil), r.report.AuditActions...)
 	report.LifecycleHooks = append([]LifecycleHookEvent(nil), r.report.LifecycleHooks...)
 	report.QueryAdvisor = append([]QueryAdvisorFinding(nil), r.report.QueryAdvisor...)
+	if r.report.OptimisticLocking != nil {
+		info := *r.report.OptimisticLocking
+		report.OptimisticLocking = &info
+	}
 	if report.Metadata == nil {
 		report.Metadata = map[string]any{}
 	}
@@ -277,6 +294,12 @@ func (c *dryRunConn) QueryContext(_ context.Context, query string, args []driver
 	if recorder != nil {
 		recorder.recordStatement("query", query, dryRunNamedValuesToAny(args)...)
 	}
+	if strings.Contains(strings.ToLower(strings.TrimSpace(query)), "returning") {
+		return &dryRunRows{
+			cols: []string{"value"},
+			data: [][]driver.Value{{nil}},
+		}, nil
+	}
 	return &dryRunRows{cols: []string{"value"}}, nil
 }
 
@@ -286,7 +309,20 @@ func (r *dryRunRows) Columns() []string { return append([]string(nil), r.cols...
 
 func (r *dryRunRows) Close() error { return nil }
 
-func (r *dryRunRows) Next(dest []driver.Value) error { return io.EOF }
+func (r *dryRunRows) Next(dest []driver.Value) error {
+	if r.idx >= len(r.data) {
+		return io.EOF
+	}
+	for i := range dest {
+		if i < len(r.data[r.idx]) {
+			dest[i] = r.data[r.idx][i]
+		} else {
+			dest[i] = nil
+		}
+	}
+	r.idx++
+	return nil
+}
 
 func (r dryRunResult) LastInsertId() (int64, error) { return 0, nil }
 

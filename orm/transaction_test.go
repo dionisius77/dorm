@@ -14,6 +14,7 @@ import (
 	"github.com/dionisius77/dorm/access"
 	"github.com/dionisius77/dorm/dialect/postgres"
 	dormerrors "github.com/dionisius77/dorm/errors"
+	"github.com/dionisius77/dorm/model"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -50,6 +51,7 @@ type transactionTestTx struct {
 
 type transactionTestRows struct {
 	cols []string
+	data [][]sqldriver.Value
 	idx  int
 }
 
@@ -127,6 +129,12 @@ func (c *transactionTestConn) QueryContext(ctx context.Context, query string, _ 
 	state.queries = append(state.queries, query)
 	state.queryContext = append(state.queryContext, ctx.Value(transactionTestContextKey{}))
 	state.mu.Unlock()
+	if strings.Contains(strings.ToLower(strings.TrimSpace(query)), "returning") {
+		return &transactionTestRows{
+			cols: []string{"id", "version"},
+			data: [][]sqldriver.Value{{int64(1), int64(2)}},
+		}, nil
+	}
 	return &transactionTestRows{
 		cols: []string{"id", "company_id", "sku", "name", "deleted_at"},
 	}, nil
@@ -139,7 +147,18 @@ func (r *transactionTestRows) Columns() []string { return append([]string(nil), 
 func (r *transactionTestRows) Close() error { return nil }
 
 func (r *transactionTestRows) Next(dest []sqldriver.Value) error {
-	return io.EOF
+	if r.idx >= len(r.data) {
+		return io.EOF
+	}
+	for i := range dest {
+		if i < len(r.data[r.idx]) {
+			dest[i] = r.data[r.idx][i]
+		} else {
+			dest[i] = nil
+		}
+	}
+	r.idx++
+	return nil
 }
 
 func (r transactionTestResult) LastInsertId() (int64, error) { return 0, nil }
@@ -308,6 +327,62 @@ func TestDBTransactionCommitAndRollback(t *testing.T) {
 	}
 	if state.beginCount != 1 || state.commitCount != 0 || state.rollbackCount != 1 {
 		t.Fatalf("unexpected rollback counts: %+v", state)
+	}
+}
+
+func TestDBTransactionUpdateWithOptimisticLocking(t *testing.T) {
+	scenario := t.Name()
+	transactionTestResetState(scenario)
+	dbConn, err := sql.Open(transactionTestDriverName, scenario)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbConn.Close()
+
+	db := New(Config{
+		DB:      dbConn,
+		Dialect: postgres.New(),
+		Schema: &schema.Schema{
+			Tables: []*schema.Table{
+				{
+					Name:       "users",
+					GoTypeName: "User",
+					Columns: []*schema.Column{
+						{Name: "id", PrimaryKey: true},
+						{Name: "version", Version: true},
+						{Name: "name"},
+					},
+				},
+			},
+		},
+	})
+
+	type User struct {
+		ID int
+		model.Version
+		Name string
+	}
+
+	ctx := context.WithValue(context.Background(), transactionTestContextKey{}, "request-update")
+	err = db.Transaction(ctx, func(tx *DB) error {
+		return tx.Update(&User{ID: 1, Version: model.Version{Version: 1}, Name: "alice"})
+	})
+	if err != nil {
+		t.Fatalf("transaction update: %v", err)
+	}
+	state := transactionTestStateFor(scenario)
+	state.mu.Lock()
+	if state.beginCount != 1 || state.commitCount != 1 || state.rollbackCount != 0 {
+		state.mu.Unlock()
+		t.Fatalf("unexpected transaction counts: %+v", state)
+	}
+	got := ""
+	if len(state.queries) > 0 {
+		got = strings.ToLower(state.queries[len(state.queries)-1])
+	}
+	state.mu.Unlock()
+	if !strings.Contains(got, `"version" = $3`) {
+		t.Fatalf("expected version predicate inside transaction, got %q", got)
 	}
 }
 

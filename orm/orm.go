@@ -287,14 +287,25 @@ func (s *Session) create(ctx context.Context, model any) error {
 	if err != nil {
 		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render insert", err)
 	}
-	if err := s.db.execReturning(ctx, sqlText, args, model, table); err != nil {
+	if _, err := s.db.execReturning(ctx, sqlText, args, model, table); err != nil {
 		return err
 	}
 	return invokeAfterCreateHook(ctx, s.db, model)
 }
 
 func (s *Session) Update(model any) error {
-	return s.db.traceOperation(s.ctx, "db.update", []Attribute{{Key: "orm.operation", Value: "update"}}, func(ctx context.Context) error {
+	attrs := []Attribute{{Key: "orm.operation", Value: "update"}}
+	if meta, rv, err := s.resolveModel(model); err == nil {
+		if info := optimisticLockingInfo(meta.table, rv); info != nil {
+			attrs = append(attrs,
+				Attribute{Key: "orm.optimistic_locking", Value: true},
+				Attribute{Key: "orm.optimistic_locking.column", Value: info.Column},
+				Attribute{Key: "orm.optimistic_locking.current", Value: info.Current},
+				Attribute{Key: "orm.optimistic_locking.next", Value: info.Next},
+			)
+		}
+	}
+	return s.db.traceWithSpan(s.ctx, "db.update", attrs, func(ctx context.Context, _ Span) error {
 		s.db.logPolicyOverride(ctx)
 		return s.update(ctx, model, nil, true)
 	})
@@ -302,7 +313,18 @@ func (s *Session) Update(model any) error {
 
 // UpdateWhere updates rows matching explicit query filters.
 func (s *Session) UpdateWhere(model any, opts ...QueryOption) error {
-	return s.db.traceOperation(s.ctx, "db.update", []Attribute{{Key: "orm.operation", Value: "update"}}, func(ctx context.Context) error {
+	attrs := []Attribute{{Key: "orm.operation", Value: "update"}}
+	if meta, rv, err := s.resolveModel(model); err == nil {
+		if info := optimisticLockingInfo(meta.table, rv); info != nil {
+			attrs = append(attrs,
+				Attribute{Key: "orm.optimistic_locking", Value: true},
+				Attribute{Key: "orm.optimistic_locking.column", Value: info.Column},
+				Attribute{Key: "orm.optimistic_locking.current", Value: info.Current},
+				Attribute{Key: "orm.optimistic_locking.next", Value: info.Next},
+			)
+		}
+	}
+	return s.db.traceWithSpan(s.ctx, "db.update", attrs, func(ctx context.Context, _ Span) error {
 		s.db.logPolicyOverride(ctx)
 		return s.update(ctx, model, opts, false)
 	})
@@ -330,9 +352,16 @@ func (s *Session) update(ctx context.Context, model any, opts []QueryOption, use
 		return err
 	}
 	setPkCols := primaryKeyColumnNames(table)
+	versionInfo := optimisticLockingInfo(table, rv)
+	if versionInfo != nil && s.db.dryRun != nil {
+		s.db.dryRun.recordOptimisticLock(versionInfo)
+	}
 	set, args := updateSetClauses(table, values, setPkCols, s.db.dialect)
 	if len(set) == 0 {
 		return errkind.New(errkind.KindInvalidSchema, fmt.Sprintf("orm: no updatable columns for %s", table.Name))
+	}
+	if versionInfo != nil {
+		set = append(set, fmt.Sprintf("%s = %s + 1", s.db.dialect.QuoteIdent(versionInfo.Column), s.db.dialect.QuoteIdent(versionInfo.Column)))
 	}
 
 	var whereCols []string
@@ -358,14 +387,30 @@ func (s *Session) update(ctx context.Context, model any, opts []QueryOption, use
 		extraPreds = append(extraPreds, state.where...)
 		extraPreds = append(extraPreds, accessPredicates(ctx, table)...)
 	}
+	if versionInfo != nil {
+		extraPreds = append(extraPreds, predicate{
+			expr: s.db.dialect.QuoteIdent(versionInfo.Column) + " = ?",
+			args: []any{versionInfo.Current},
+		})
+	}
 
-	whereSQL, whereArgs := buildWhereClauses(whereCols, whereArgs, extraPreds, s.db.dialect)
+	whereSQL, whereArgs := buildWhereClauses(whereCols, whereArgs, extraPreds, len(args)+1, s.db.dialect)
 	sqlText, err := s.db.dialect.RenderUpdate(table.Name, set, whereSQL, returningColumns(table))
 	if err != nil {
 		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render update", err)
 	}
-	if err := s.db.execReturning(ctx, sqlText, append(args, whereArgs...), model, table); err != nil {
+	rowsAffected, err := s.db.execReturning(ctx, sqlText, append(args, whereArgs...), model, table)
+	if err != nil {
 		return err
+	}
+	if versionInfo != nil {
+		versionInfo.Conflict = rowsAffected == 0
+		if s.db.dryRun != nil {
+			s.db.dryRun.recordOptimisticLock(versionInfo)
+		}
+		if rowsAffected == 0 {
+			return dormerrors.ErrOptimisticLockFailed
+		}
 	}
 	return invokeAfterUpdateHook(ctx, s.db, model)
 }
@@ -436,7 +481,8 @@ func (s *Session) Upsert(model any) error {
 		}
 		set := upsertSetClauses(table, values, conflict, s.db.dialect)
 		sqlText := strings.TrimSuffix(insertSQL, ";") + " ON CONFLICT (" + strings.Join(quoteColumns(conflict, s.db.dialect), ", ") + ") DO UPDATE SET " + strings.Join(set, ", ") + ";"
-		return s.db.execReturning(ctx, sqlText, args, model, table)
+		_, err = s.db.execReturning(ctx, sqlText, args, model, table)
+		return err
 	})
 }
 
@@ -937,6 +983,9 @@ func applyStructFieldValues(db *DB, ctx context.Context, table *schema.Table, rv
 		return nil
 	}
 	for _, col := range table.Columns {
+		if col.Version {
+			continue
+		}
 		if _, ok := values[col.Name]; ok {
 			continue
 		}
@@ -1012,11 +1061,68 @@ func orderedColumnsAndArgs(table *schema.Table, values map[string]any, includePr
 func returningColumns(table *schema.Table) []string {
 	var cols []string
 	for _, col := range table.Columns {
-		if col.PrimaryKey || col.CreatedAt || col.UpdatedAt || col.DeletedAt {
+		if col.PrimaryKey || col.CreatedAt || col.UpdatedAt || col.DeletedAt || col.Version {
 			cols = append(cols, col.Name)
 		}
 	}
 	return cols
+}
+
+func versionColumn(table *schema.Table) *schema.Column {
+	for _, col := range table.Columns {
+		if col != nil && col.Version {
+			return col
+		}
+	}
+	return nil
+}
+
+func optimisticLockingInfo(table *schema.Table, rv reflect.Value) *OptimisticLockingInfo {
+	col := versionColumn(table)
+	if col == nil {
+		return nil
+	}
+	field := fieldByColumn(rv, table, col.Name)
+	if !field.IsValid() || !field.CanInterface() {
+		return &OptimisticLockingInfo{Enabled: true, Column: col.Name}
+	}
+	current := field.Interface()
+	info := &OptimisticLockingInfo{
+		Enabled: true,
+		Column:  col.Name,
+		Current: current,
+	}
+	if next, ok := incrementVersionValue(current); ok {
+		info.Next = next
+	}
+	return info
+}
+
+func incrementVersionValue(v any) (any, bool) {
+	switch current := v.(type) {
+	case int:
+		return current + 1, true
+	case int8:
+		return current + 1, true
+	case int16:
+		return current + 1, true
+	case int32:
+		return current + 1, true
+	case int64:
+		return current + 1, true
+	case uint:
+		return current + 1, true
+	case uint8:
+		return current + 1, true
+	case uint16:
+		return current + 1, true
+	case uint32:
+		return current + 1, true
+	case uint64:
+		return current + 1, true
+	default:
+		return nil, false
+	}
 }
 
 func updateSetClauses(table *schema.Table, values map[string]any, pkCols []string, d dialect.Dialect) ([]string, []any) {
@@ -1029,6 +1135,9 @@ func updateSetClauses(table *schema.Table, values map[string]any, pkCols []strin
 	argIndex := 1
 	for _, col := range table.Columns {
 		if _, ok := pk[col.Name]; ok {
+			continue
+		}
+		if col.Version {
 			continue
 		}
 		v, ok := values[col.Name]
@@ -1052,6 +1161,9 @@ func upsertSetClauses(table *schema.Table, values map[string]any, conflict []str
 		if _, ok := conflictSet[col.Name]; ok {
 			continue
 		}
+		if col.Version {
+			continue
+		}
 		if _, ok := values[col.Name]; !ok {
 			continue
 		}
@@ -1070,10 +1182,10 @@ func conflictColumns(table *schema.Table) []string {
 	return cols
 }
 
-func buildWhereClauses(cols []string, args []any, extra []predicate, d dialect.Dialect) ([]string, []any) {
+func buildWhereClauses(cols []string, args []any, extra []predicate, start int, d dialect.Dialect) ([]string, []any) {
 	var where []string
 	whereArgs := append([]any(nil), args...)
-	argIndex := len(whereArgs) + 1
+	argIndex := start
 	for _, col := range cols {
 		where = append(where, d.QuoteIdent(col)+" = "+d.Placeholder(argIndex))
 		argIndex++
@@ -1169,12 +1281,12 @@ func (s *Session) softDelete(ctx context.Context, model any, table *schema.Table
 	if err != nil {
 		return err
 	}
-	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), s.db.dialect)
 	set, args := updateSetClauses(table, values, pkCols, s.db.dialect)
 	if len(set) == 0 {
 		set = []string{s.db.dialect.QuoteIdent(soft.Name) + " = " + s.db.dialect.Placeholder(1)}
 		args = []any{now}
 	}
+	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), len(args)+1, s.db.dialect)
 	sqlText, err := s.db.dialect.RenderUpdate(table.Name, set, whereSQL, nil)
 	if err != nil {
 		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render soft delete", err)
@@ -1213,7 +1325,7 @@ func (s *Session) delete(ctx context.Context, model any) error {
 	if len(pkCols) == 0 {
 		return errkind.New(errkind.KindInvalidSchema, "orm: delete requires primary key")
 	}
-	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), s.db.dialect)
+	whereSQL, whereArgs := buildWhereClauses(pkCols, pkArgs, accessPredicates(ctx, table), 1, s.db.dialect)
 	sqlText, err := s.db.dialect.RenderDelete(table.Name, whereSQL, nil)
 	if err != nil {
 		return errkind.Wrap(errkind.KindUnsupportedFeature, "orm: render delete", err)
@@ -1527,42 +1639,65 @@ func (db *DB) queryContext(ctx context.Context, sqlText string, args ...any) (*s
 	return rows, nil
 }
 
-func (db *DB) execReturning(ctx context.Context, sqlText string, args []any, model any, table *schema.Table) error {
+func (db *DB) execReturning(ctx context.Context, sqlText string, args []any, model any, table *schema.Table) (int64, error) {
 	if !strings.Contains(strings.ToUpper(sqlText), " RETURNING ") {
-		_, err := db.execContext(ctx, sqlText, args...)
-		return err
+		res, err := db.execContext(ctx, sqlText, args...)
+		if err != nil {
+			return -1, err
+		}
+		if res == nil {
+			return -1, nil
+		}
+		rows, rowsErr := res.RowsAffected()
+		if rowsErr != nil {
+			return -1, nil
+		}
+		return rows, nil
 	}
 	rows, err := db.queryContext(ctx, sqlText, args...)
 	if err != nil {
-		return err
+		return -1, err
 	}
 	defer rows.Close()
-	if rows.Next() {
+	var count int64
+	for rows.Next() {
+		count++
 		cols, err := rows.Columns()
 		if err != nil {
-			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: rows columns", err)
+			return -1, errkind.Wrap(errkind.KindRuntimeQuery, "orm: rows columns", err)
 		}
-		holder := make([]any, len(cols))
-		for i := range holder {
-			var value any
-			holder[i] = &value
-		}
-		if err := rows.Scan(holder...); err != nil {
-			return errkind.Wrap(errkind.KindRuntimeQuery, "orm: scan returning row", err)
-		}
-		rv := reflect.ValueOf(model)
-		if rv.Kind() == reflect.Pointer && !rv.IsNil() {
-			for i, col := range cols {
-				if valuePtr, ok := holder[i].(*any); ok {
-					setFieldByColumn(rv, table, col, *valuePtr)
+		if count == 1 {
+			holder := make([]any, len(cols))
+			for i := range holder {
+				var value any
+				holder[i] = &value
+			}
+			if err := rows.Scan(holder...); err != nil {
+				return -1, errkind.Wrap(errkind.KindRuntimeQuery, "orm: scan returning row", err)
+			}
+			rv := reflect.ValueOf(model)
+			if rv.Kind() == reflect.Pointer && !rv.IsNil() {
+				for i, col := range cols {
+					if valuePtr, ok := holder[i].(*any); ok {
+						setFieldByColumn(rv, table, col, *valuePtr)
+					}
 				}
 			}
+			continue
+		}
+		discard := make([]any, len(cols))
+		for i := range discard {
+			var value any
+			discard[i] = &value
+		}
+		if err := rows.Scan(discard...); err != nil {
+			return -1, errkind.Wrap(errkind.KindRuntimeQuery, "orm: scan returning row", err)
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return errkind.Wrap(errkind.KindRuntimeQuery, "orm: returning rows", err)
+		return -1, errkind.Wrap(errkind.KindRuntimeQuery, "orm: returning rows", err)
 	}
-	return nil
+	return count, nil
 }
 
 func (db *DB) logPolicyOverride(ctx context.Context) {

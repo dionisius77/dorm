@@ -37,3 +37,4 @@ This directory contains the architectural contract for the ORM.
 - [ADR-031: Query Analyzer](./ADR-031-query-analyzer.md)
 - [ADR-032: Execution Inspection & Dry Run](./ADR-032-execution-inspection.md)
 - [ADR-033: Raw SQL & Explicit Policy Bypass](./ADR-033-raw-sql-explicit-policy.md)
+- [ADR-034: Optimistic Locking](./ADR-034-optimistic-locking.md)

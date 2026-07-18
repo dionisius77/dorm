@@ -106,7 +106,7 @@ If no schema changes exist, no migration is generated.
 
 ---
 
-## 🔍 Schema Drift Detection
+## Schema Drift Detection
 
 Detect differences between:
 
@@ -214,6 +214,20 @@ type Product struct {
     Name string
 }
 ```
+
+Optimistic locking:
+
+```go
+type User struct {
+    model.Company
+    model.Version
+
+    ID   uuid.UUID
+    Name string
+}
+```
+
+`model.Version` enables safe concurrent updates with automatic version checks.
 
 Raw model:
 

@@ -26,6 +26,7 @@ type QueryAdvisorFinding = orm.QueryAdvisorFinding
 type QueryAdvisorInput = orm.QueryAdvisorInput
 type QueryAdvisorReport = orm.QueryAdvisorReport
 type QueryAdvisor = orm.QueryAdvisor
+type OptimisticLockingInfo = orm.OptimisticLockingInfo
 
 const (
 	ExecutionStatusSkipped             = orm.ExecutionStatusSkipped
