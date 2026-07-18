@@ -48,7 +48,11 @@ type openTestRows struct {
 type openTestResult struct{}
 
 type openTestTracerProvider struct {
-	spans int
+	mu        sync.Mutex
+	spans     int
+	spanNames []string
+	attrs     [][]orm.Attribute
+	ctxVals   []string
 }
 
 type openTestTracer struct {
@@ -57,7 +61,10 @@ type openTestTracer struct {
 
 type openTestSpan struct {
 	provider *openTestTracerProvider
+	index    int
 }
+
+type openTestContextKey struct{}
 
 func init() {
 	registerOpenTestSQLDriver()
@@ -89,7 +96,7 @@ func (c *openTestConn) Begin() (sqldriver.Tx, error) {
 	return nil, fmt.Errorf("transactions not supported")
 }
 
-func (c *openTestConn) Ping(context.Context) error { return nil }
+func (c *openTestConn) Ping(ctx context.Context) error { return ctx.Err() }
 
 func (c *openTestConn) ExecContext(context.Context, string, []sqldriver.NamedValue) (sqldriver.Result, error) {
 	return openTestResult{}, nil
@@ -142,17 +149,32 @@ func (p *openTestTracerProvider) Tracer(string) orm.Tracer {
 }
 
 func (t openTestTracer) Start(ctx context.Context, name string, _ ...orm.SpanOption) (context.Context, orm.Span) {
-	_ = ctx
-	_ = name
+	t.provider.mu.Lock()
 	t.provider.spans++
-	return ctx, openTestSpan{provider: t.provider}
+	t.provider.spanNames = append(t.provider.spanNames, name)
+	t.provider.attrs = append(t.provider.attrs, nil)
+	if v, ok := ctx.Value(openTestContextKey{}).(string); ok {
+		t.provider.ctxVals = append(t.provider.ctxVals, v)
+	} else {
+		t.provider.ctxVals = append(t.provider.ctxVals, "")
+	}
+	idx := len(t.provider.spanNames) - 1
+	t.provider.mu.Unlock()
+	return ctx, openTestSpan{provider: t.provider, index: idx}
 }
 
 func (s openTestSpan) End() {}
 
 func (s openTestSpan) RecordError(error) {}
 
-func (s openTestSpan) SetAttributes(...orm.Attribute) {}
+func (s openTestSpan) SetAttributes(attrs ...orm.Attribute) {
+	s.provider.mu.Lock()
+	defer s.provider.mu.Unlock()
+	if s.index < 0 || s.index >= len(s.provider.attrs) {
+		return
+	}
+	s.provider.attrs[s.index] = append(s.provider.attrs[s.index], attrs...)
+}
 
 func (r *openTestRows) Columns() []string { return append([]string(nil), r.cols...) }
 
@@ -207,6 +229,7 @@ func openTestConstraintRows(string) [][]sqldriver.Value {
 type testOpenDriver struct {
 	scenario  string
 	preflight dormdriver.PreflightConfig
+	inspector schema.Inspector
 }
 
 func (d testOpenDriver) Validate() error { return nil }
@@ -220,6 +243,18 @@ func (d testOpenDriver) Open(context.Context) (*sql.DB, error) {
 }
 
 func (d testOpenDriver) PreflightConfig() dormdriver.PreflightConfig { return d.preflight }
+
+func (d testOpenDriver) Inspector() schema.Inspector { return d.inspector }
+
+func (d testOpenDriver) ConnectionInfo() dormdriver.ConnectionInfo {
+	return dormdriver.ConnectionInfo{
+		System:        "postgresql",
+		Name:          d.scenario,
+		Namespace:     "public",
+		ServerAddress: "localhost",
+		ServerPort:    5432,
+	}
+}
 
 func writeOpenTestSnapshot(t *testing.T, root string) string {
 	t.Helper()
@@ -285,11 +320,26 @@ func TestOpenSkipsPreflightWhenDisabled(t *testing.T) {
 	}
 }
 
+func TestRegisterDriverStoresRegisteredDriver(t *testing.T) {
+	prev := RegisteredDriver()
+	t.Cleanup(func() { RegisterDriver(prev) })
+
+	drv := testOpenDriver{scenario: "registered"}
+	RegisterDriver(drv)
+	if got := RegisteredDriver(); got != drv {
+		t.Fatalf("expected registered driver to be returned")
+	}
+}
+
 func TestOpenRunsPreflightWhenEnabled(t *testing.T) {
 	root := t.TempDir()
 	modelRoot := filepath.Join(root, "models")
 	writeOpenTestModel(t, modelRoot)
 	snapshotPath := writeOpenTestSnapshot(t, modelRoot)
+	snap, err := schema.LoadSnapshot(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
 
 	scenario := "success"
 	state := openTestStateFor(scenario)
@@ -297,6 +347,7 @@ func TestOpenRunsPreflightWhenEnabled(t *testing.T) {
 	state.closed = 0
 	state.queries = nil
 	state.mu.Unlock()
+	inspector := &staticSchemaInspector{schema: snap.Schema}
 
 	db, err := Open(context.Background(), testOpenDriver{
 		scenario: scenario,
@@ -306,16 +357,15 @@ func TestOpenRunsPreflightWhenEnabled(t *testing.T) {
 			SnapshotPath: snapshotPath,
 			SchemaName:   "public",
 		},
+		inspector: inspector,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	state.mu.Lock()
-	defer state.mu.Unlock()
-	if len(state.queries) == 0 {
-		t.Fatal("expected preflight queries to run")
+	if inspector.calls == 0 {
+		t.Fatal("expected preflight inspector to run")
 	}
 }
 
@@ -324,6 +374,14 @@ func TestOpenFailsOnPreflightDriftAndClosesDB(t *testing.T) {
 	modelRoot := filepath.Join(root, "models")
 	writeOpenTestModel(t, modelRoot)
 	snapshotPath := writeOpenTestSnapshot(t, modelRoot)
+	snap, err := schema.LoadSnapshot(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	drift := snap.Schema.Clone()
+	if len(drift.Tables) > 0 {
+		drift.Tables[0].Columns = drift.Tables[0].Columns[:1]
+	}
 
 	scenario := "drift"
 	state := openTestStateFor(scenario)
@@ -332,7 +390,7 @@ func TestOpenFailsOnPreflightDriftAndClosesDB(t *testing.T) {
 	state.queries = nil
 	state.mu.Unlock()
 
-	_, err := Open(context.Background(), testOpenDriver{
+	_, openErr := Open(context.Background(), testOpenDriver{
 		scenario: scenario,
 		preflight: dormdriver.PreflightConfig{
 			Enabled:      true,
@@ -340,12 +398,13 @@ func TestOpenFailsOnPreflightDriftAndClosesDB(t *testing.T) {
 			SnapshotPath: snapshotPath,
 			SchemaName:   "public",
 		},
+		inspector: &staticSchemaInspector{schema: drift},
 	})
-	if err == nil {
+	if openErr == nil {
 		t.Fatal("expected preflight drift error")
 	}
-	if !strings.Contains(err.Error(), "schema preflight detected drift") {
-		t.Fatalf("unexpected error: %v", err)
+	if !strings.Contains(openErr.Error(), "schema preflight detected drift") {
+		t.Fatalf("unexpected error: %v", openErr)
 	}
 
 	state.mu.Lock()
@@ -383,5 +442,113 @@ func TestOpenAppliesObservabilityConfig(t *testing.T) {
 	}
 	if provider.spans == 0 {
 		t.Fatal("expected observability tracer to be used")
+	}
+}
+
+type staticSchemaInspector struct {
+	schema *schema.Schema
+	calls  int
+}
+
+func (i *staticSchemaInspector) Inspect(context.Context, *sql.DB, string) (*schema.Schema, error) {
+	i.calls++
+	if i.schema == nil {
+		return nil, fmt.Errorf("nil schema")
+	}
+	return i.schema.Clone(), nil
+}
+
+func TestOpenResolvesInspectorFromDriver(t *testing.T) {
+	root := t.TempDir()
+	modelRoot := filepath.Join(root, "models")
+	writeOpenTestModel(t, modelRoot)
+	snapshotPath := writeOpenTestSnapshot(t, modelRoot)
+	snap, err := schema.LoadSnapshot(snapshotPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	inspector := &staticSchemaInspector{schema: snap.Schema}
+	db, err := Open(context.Background(), testOpenDriver{
+		scenario: "inspector",
+		preflight: dormdriver.PreflightConfig{
+			Enabled:      true,
+			Root:         modelRoot,
+			SnapshotPath: snapshotPath,
+			SchemaName:   "public",
+		},
+		inspector: inspector,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	if inspector.calls == 0 {
+		t.Fatal("expected driver inspector to be used during preflight")
+	}
+}
+
+func TestOpenPropagatesContextCancellation(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	cancel()
+	_, err := Open(ctx, testOpenDriver{
+		scenario: "canceled",
+	})
+	if err == nil {
+		t.Fatal("expected canceled context error")
+	}
+	if !strings.Contains(err.Error(), "context canceled") {
+		t.Fatalf("expected context cancellation to propagate, got %v", err)
+	}
+}
+
+func TestOpenEmitsConnectionLifecycleSpans(t *testing.T) {
+	provider := &openTestTracerProvider{}
+	ctx := context.WithValue(context.Background(), openTestContextKey{}, "trace-root")
+	db, err := Open(ctx, testOpenDriver{
+		scenario: "trace",
+	}, WithObservability(orm.ObservabilityConfig{
+		Tracing:        true,
+		TracerProvider: provider,
+		SQLLogging:     orm.SQLLogDisabled,
+		TraceSQL:       orm.TraceSQLDisabled,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := db.Close(); err != nil {
+		t.Fatal(err)
+	}
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	for _, want := range []string{"db.connect", "db.ping", "db.close"} {
+		found := false
+		for _, got := range provider.spanNames {
+			if got == want {
+				found = true
+				break
+			}
+		}
+		if !found {
+			t.Fatalf("expected span %q in %v", want, provider.spanNames)
+		}
+	}
+	for i, got := range provider.ctxVals {
+		if got != "trace-root" {
+			t.Fatalf("expected span %d to inherit context value, got %q", i, got)
+		}
+	}
+	if len(provider.attrs) == 0 {
+		t.Fatal("expected connection span attributes")
+	}
+	attrs := map[string]any{}
+	for _, attr := range provider.attrs[0] {
+		attrs[attr.Key] = attr.Value
+	}
+	for _, want := range []string{"db.system", "db.name", "db.namespace", "server.address", "server.port"} {
+		if _, ok := attrs[want]; !ok {
+			t.Fatalf("expected %s attribute in connection span, got %#v", want, attrs)
+		}
 	}
 }

@@ -10,6 +10,7 @@ import (
 
 	"github.com/dionisius77/dorm/dialect"
 	"github.com/dionisius77/dorm/dialect/postgres"
+	driverpostgres "github.com/dionisius77/dorm/driver/postgres"
 	"github.com/dionisius77/dorm/errkind"
 	"github.com/dionisius77/dorm/schema"
 )
@@ -37,7 +38,7 @@ type User struct {
 		MigrationsDir: migrationsDir,
 		SnapshotPath:  snapshotPath,
 		Dialect:       postgres.New(),
-		Inspector:     schema.PostgresInspector{},
+		Inspector:     driverpostgres.New(driverpostgres.Config{DSN: "test", SchemaName: "public"}).Inspector(),
 	})
 	result, err := service.Generate(context.Background())
 	if err != nil {
@@ -74,7 +75,7 @@ type User struct {
 		MigrationsDir: filepath.Join(dir, "migrations"),
 		SnapshotPath:  filepath.Join(dir, "schemas", "current.snapshot.json"),
 		Dialect:       failingDialect{},
-		Inspector:     schema.PostgresInspector{},
+		Inspector:     driverpostgres.New(driverpostgres.Config{DSN: "test", SchemaName: "public"}).Inspector(),
 	})
 	_, err := service.Generate(context.Background())
 	if err == nil {

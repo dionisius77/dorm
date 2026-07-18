@@ -5,6 +5,7 @@ import (
 	"testing"
 
 	"github.com/dionisius77/dorm/benchmark/testutil"
+	driverpostgres "github.com/dionisius77/dorm/driver/postgres"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -18,7 +19,7 @@ func BenchmarkSchemaDrift(b *testing.B) {
 
 	b.ResetTimer()
 	for i := 0; i < b.N; i++ {
-		report, err := schema.DetectDriftFromSource(context.Background(), fixture.Project.ModelsDir, schema.PostgresInspector{}, db, fixture.Project.Schema, fixture.Project.SnapshotPath)
+		report, err := schema.DetectDriftFromSource(context.Background(), fixture.Project.ModelsDir, driverpostgres.New(driverpostgres.Config{DSN: fixture.Project.DSN, SchemaName: fixture.Project.Schema}).Inspector(), db, fixture.Project.Schema, fixture.Project.SnapshotPath)
 		if err != nil {
 			b.Fatal(err)
 		}

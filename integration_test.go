@@ -11,6 +11,7 @@ import (
 
 	"github.com/dionisius77/dorm/access"
 	"github.com/dionisius77/dorm/dialect/postgres"
+	driverpostgres "github.com/dionisius77/dorm/driver/postgres"
 	"github.com/dionisius77/dorm/internal/itest"
 	"github.com/dionisius77/dorm/migrate"
 	"github.com/dionisius77/dorm/orm"
@@ -344,7 +345,7 @@ func TestIntegrationMigrationGenerateRunRollbackAndDrift(t *testing.T) {
 		SnapshotPath:  project.SnapshotPath,
 		SchemaName:    project.Schema,
 		Dialect:       postgres.New(),
-		Inspector:     schema.PostgresInspector{},
+		Inspector:     driverpostgres.New(driverpostgres.Config{DSN: project.DSN, SchemaName: project.Schema}).Inspector(),
 	})
 	result, err := service.Generate(context.Background())
 	if err != nil {
@@ -368,7 +369,7 @@ func TestIntegrationMigrationGenerateRunRollbackAndDrift(t *testing.T) {
 	if err := service.Run(context.Background(), db.SQLDB()); err != nil {
 		t.Fatalf("run migrations: %v", err)
 	}
-	report, err := schema.DetectDriftFromSource(context.Background(), project.ModelsDir, schema.PostgresInspector{}, db.SQLDB(), project.Schema, project.SnapshotPath)
+	report, err := schema.DetectDriftFromSource(context.Background(), project.ModelsDir, driverpostgres.New(driverpostgres.Config{DSN: project.DSN, SchemaName: project.Schema}).Inspector(), db.SQLDB(), project.Schema, project.SnapshotPath)
 	if err != nil {
 		t.Fatalf("detect drift: %v", err)
 	}
@@ -452,7 +453,7 @@ func prepareMigratedProject(t *testing.T) (*itest.Project, *migrate.Result) {
 		SnapshotPath:  project.SnapshotPath,
 		SchemaName:    project.Schema,
 		Dialect:       postgres.New(),
-		Inspector:     schema.PostgresInspector{},
+		Inspector:     driverpostgres.New(driverpostgres.Config{DSN: project.DSN, SchemaName: project.Schema}).Inspector(),
 	})
 	result, err := service.Generate(context.Background())
 	if err != nil {

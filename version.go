@@ -8,7 +8,7 @@ const (
 	// VersionMinor is the minor release component for the current public API.
 	VersionMinor = 4
 	// VersionPatch is the patch release component for the current public API.
-	VersionPatch = 1
+	VersionPatch = 2
 )
 
 // Version returns the current module version in semantic version format.

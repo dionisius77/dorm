@@ -10,9 +10,9 @@ import (
 	"testing"
 
 	"github.com/dionisius77/dorm/dialect/postgres"
+	driverpostgres "github.com/dionisius77/dorm/driver/postgres"
 	"github.com/dionisius77/dorm/internal/itest"
 	"github.com/dionisius77/dorm/migrate"
-	"github.com/dionisius77/dorm/schema"
 )
 
 func TestCLIIntegrationCommands(t *testing.T) {
@@ -36,7 +36,7 @@ func TestCLIIntegrationCommands(t *testing.T) {
 		SnapshotPath:  project.SnapshotPath,
 		SchemaName:    project.Schema,
 		Dialect:       postgres.New(),
-		Inspector:     schema.PostgresInspector{},
+		Inspector:     driverpostgres.New(driverpostgres.Config{DSN: project.DSN, SchemaName: project.Schema}).Inspector(),
 	})
 	result, err := service.Generate(context.Background())
 	if err != nil {

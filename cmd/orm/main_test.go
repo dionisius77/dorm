@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/dionisius77/dorm"
+	driverpostgres "github.com/dionisius77/dorm/driver/postgres"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -133,6 +134,38 @@ func TestInitCreatesProjectStructure(t *testing.T) {
 		if _, err := os.Stat(path); err != nil {
 			t.Fatalf("expected %s: %v", path, err)
 		}
+	}
+}
+
+func TestConfiguredDriverRegistersDriver(t *testing.T) {
+	prev := dorm.RegisteredDriver()
+	t.Cleanup(func() {
+		dorm.RegisterDriver(prev)
+	})
+	cfg := cliConfig{
+		Driver: "postgres",
+		DSN:    "registered-driver",
+	}
+	drv, err := configuredDriver(cfg)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := dorm.RegisteredDriver(); got != drv {
+		t.Fatalf("expected registered driver to be reused")
+	}
+}
+
+func TestDriverInspectorResolvesThroughDriver(t *testing.T) {
+	drv := driverpostgres.New(driverpostgres.Config{
+		DSN:        "inspector",
+		DriverName: "postgres",
+	})
+	inspector := driverInspector(drv)
+	if inspector == nil {
+		t.Fatal("expected inspector from driver")
+	}
+	if _, ok := inspector.(schema.PostgresInspector); !ok {
+		t.Fatalf("expected postgres inspector, got %T", inspector)
 	}
 }
 

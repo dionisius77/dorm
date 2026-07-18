@@ -15,6 +15,7 @@ import (
 	pgdialect "github.com/dionisius77/dorm/dialect/postgres"
 	"github.com/dionisius77/dorm/driver"
 	dormerrors "github.com/dionisius77/dorm/errors"
+	"github.com/dionisius77/dorm/schema"
 	"github.com/jackc/pgx/v5/stdlib"
 )
 
@@ -51,6 +52,8 @@ type Driver struct {
 
 var _ driver.Driver = (*Driver)(nil)
 var _ driver.PreflightProvider = (*Driver)(nil)
+var _ driver.InspectorProvider = (*Driver)(nil)
+var _ driver.ConnectionInfoProvider = (*Driver)(nil)
 
 func New(cfg Config) *Driver {
 	cfg = normalizeConfig(cfg)
@@ -139,14 +142,40 @@ func (d *Driver) PreflightConfig() driver.PreflightConfig {
 	}
 }
 
+func (d *Driver) Inspector() schema.Inspector {
+	return schema.PostgresInspector{}
+}
+
+func (d *Driver) ConnectionInfo() driver.ConnectionInfo {
+	if d == nil {
+		return driver.ConnectionInfo{}
+	}
+	return driver.ConnectionInfo{
+		System:        "postgresql",
+		Name:          d.cfg.Database,
+		Namespace:     d.cfg.SchemaName,
+		ServerAddress: d.cfg.Host,
+		ServerPort:    d.cfg.Port,
+	}
+}
+
 func (d *Driver) Open(ctx context.Context) (*sql.DB, error) {
-	_ = ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, dormerrors.NewDriverError(dormerrors.KindConfiguration, d.Name(), "open", err)
+	}
 	if err := d.Validate(); err != nil {
 		return nil, err
 	}
 	ensureRegistered(d.Name())
 	db, err := sql.Open(d.Name(), d.dsn())
 	if err != nil {
+		return nil, dormerrors.NewDriverError(dormerrors.KindConfiguration, d.Name(), "open", err)
+	}
+	if err := ctx.Err(); err != nil {
+		_ = db.Close()
 		return nil, dormerrors.NewDriverError(dormerrors.KindConfiguration, d.Name(), "open", err)
 	}
 	if d.cfg.MaxOpenConns > 0 {

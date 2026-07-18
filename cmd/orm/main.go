@@ -14,7 +14,7 @@ import (
 
 	"github.com/dionisius77/dorm"
 	"github.com/dionisius77/dorm/analyzer"
-	"github.com/dionisius77/dorm/dialect/postgres"
+	dormdriver "github.com/dionisius77/dorm/driver"
 	driverpostgres "github.com/dionisius77/dorm/driver/postgres"
 	"github.com/dionisius77/dorm/errkind"
 	"github.com/dionisius77/dorm/migrate"
@@ -126,13 +126,17 @@ func cmdMigrateGenerate(ctx context.Context, args []string) error {
 	if err := validateProjectPaths(*root, cfg, true); err != nil {
 		return errkind.Wrap(errkind.KindConfiguration, "migrate generate: validate project", err)
 	}
+	drv, err := configuredDriver(cfg)
+	if err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "migrate generate: configure driver", err)
+	}
 	service := migrate.NewService(migrate.Config{
 		Root:          filepath.Join(*root, cfg.ModelsDir),
 		MigrationsDir: filepath.Join(*root, cfg.MigrationsDir),
 		SnapshotPath:  filepath.Join(*root, cfg.SnapshotPath),
 		SchemaName:    cfg.SchemaName,
-		Dialect:       postgres.New(),
-		Inspector:     schema.PostgresInspector{},
+		Dialect:       drv.Dialect(),
+		Inspector:     driverInspector(drv),
 	})
 	result, err := service.Generate(ctx)
 	if err != nil {
@@ -159,7 +163,11 @@ func cmdMigrateRun(ctx context.Context, args []string) error {
 	if err := validateProjectPaths(*root, cfg, false); err != nil {
 		return errkind.Wrap(errkind.KindConfiguration, "migrate run: validate project", err)
 	}
-	db, err := openConfiguredDB(ctx, cfg)
+	drv, err := configuredDriver(cfg)
+	if err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "migrate run: configure driver", err)
+	}
+	db, err := openConfiguredDB(ctx, drv)
 	if err != nil {
 		return err
 	}
@@ -169,8 +177,8 @@ func cmdMigrateRun(ctx context.Context, args []string) error {
 		MigrationsDir: filepath.Join(*root, cfg.MigrationsDir),
 		SnapshotPath:  filepath.Join(*root, cfg.SnapshotPath),
 		SchemaName:    cfg.SchemaName,
-		Dialect:       postgres.New(),
-		Inspector:     schema.PostgresInspector{},
+		Dialect:       drv.Dialect(),
+		Inspector:     driverInspector(drv),
 	})
 	if err := service.Run(ctx, db.SQLDB()); err != nil {
 		return errkind.Wrap(errkind.KindMigrationApplication, "migrate run: apply migrations", err)
@@ -195,7 +203,11 @@ func cmdMigrateRevert(ctx context.Context, args []string) error {
 	if err != nil {
 		return errkind.Wrap(errkind.KindConfiguration, "migrate rollback: load config", err)
 	}
-	db, err := openConfiguredDB(ctx, cfg)
+	drv, err := configuredDriver(cfg)
+	if err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "migrate rollback: configure driver", err)
+	}
+	db, err := openConfiguredDB(ctx, drv)
 	if err != nil {
 		return err
 	}
@@ -205,8 +217,8 @@ func cmdMigrateRevert(ctx context.Context, args []string) error {
 		MigrationsDir: filepath.Join(*root, cfg.MigrationsDir),
 		SnapshotPath:  filepath.Join(*root, cfg.SnapshotPath),
 		SchemaName:    cfg.SchemaName,
-		Dialect:       postgres.New(),
-		Inspector:     schema.PostgresInspector{},
+		Dialect:       drv.Dialect(),
+		Inspector:     driverInspector(drv),
 	})
 	if err := service.Revert(ctx, db.SQLDB(), *name); err != nil {
 		return errkind.Wrap(errkind.KindMigrationApplication, fmt.Sprintf("migrate rollback: %s", *name), err)
@@ -229,18 +241,22 @@ func cmdMigrateStatus(ctx context.Context, args []string) error {
 	if err := validateProjectPaths(*root, cfg, false); err != nil {
 		return errkind.Wrap(errkind.KindConfiguration, "migrate status: validate project", err)
 	}
-	db, err := openConfiguredDB(ctx, cfg)
+	drv, err := configuredDriver(cfg)
+	if err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "migrate status: configure driver", err)
+	}
+	db, err := openConfiguredDB(ctx, drv)
 	if err != nil {
 		return err
 	}
 	defer db.Close()
-	if err := db.PingContext(context.Background()); err != nil {
+	if err := db.PingContext(ctx); err != nil {
 		return errkind.Wrap(errkind.KindRuntimeQuery, "migrate status: ping database", err)
 	}
-	if err := ensureMigrationRegistry(context.Background(), db.SQLDB()); err != nil {
+	if err := ensureMigrationRegistry(ctx, db.SQLDB()); err != nil {
 		return errkind.Wrap(errkind.KindMigrationApplication, "migrate status: ensure migration registry", err)
 	}
-	applied, err := appliedMigrationSet(context.Background(), db.SQLDB())
+	applied, err := appliedMigrationSet(ctx, db.SQLDB())
 	if err != nil {
 		return errkind.Wrap(errkind.KindMigrationApplication, "migrate status: read applied migrations", err)
 	}
@@ -249,8 +265,8 @@ func cmdMigrateStatus(ctx context.Context, args []string) error {
 		MigrationsDir: filepath.Join(*root, cfg.MigrationsDir),
 		SnapshotPath:  filepath.Join(*root, cfg.SnapshotPath),
 		SchemaName:    cfg.SchemaName,
-		Dialect:       postgres.New(),
-		Inspector:     schema.PostgresInspector{},
+		Dialect:       drv.Dialect(),
+		Inspector:     driverInspector(drv),
 	})
 	names, err := service.Status()
 	if err != nil {
@@ -334,7 +350,11 @@ func cmdSeedRun(ctx context.Context, args []string) error {
 	if err := validateProjectPaths(*root, cfg, false); err != nil {
 		return errkind.Wrap(errkind.KindConfiguration, "seed run: validate project", err)
 	}
-	db, err := openConfiguredDB(ctx, cfg)
+	drv, err := configuredDriver(cfg)
+	if err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "seed run: configure driver", err)
+	}
+	db, err := openConfiguredDB(ctx, drv)
 	if err != nil {
 		return err
 	}
@@ -391,7 +411,11 @@ func cmdSchemaCheck(ctx context.Context, args []string) error {
 	if err := validateProjectPaths(*root, cfg, true); err != nil {
 		return errkind.Wrap(errkind.KindConfiguration, "schema check: validate project", err)
 	}
-	db, err := openConfiguredDB(ctx, cfg)
+	drv, err := configuredDriver(cfg)
+	if err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "schema check: configure driver", err)
+	}
+	db, err := openConfiguredDB(ctx, drv)
 	if err != nil {
 		return err
 	}
@@ -402,7 +426,7 @@ func cmdSchemaCheck(ctx context.Context, args []string) error {
 	report, err := schema.DetectDriftFromSource(
 		ctx,
 		filepath.Join(*root, cfg.ModelsDir),
-		schema.PostgresInspector{},
+		driverInspector(drv),
 		db.SQLDB(),
 		cfg.SchemaName,
 		filepath.Join(*root, cfg.SnapshotPath),
@@ -448,8 +472,12 @@ func cmdDoctor(ctx context.Context, args []string) error {
 	if cfg.Root == "" || cfg.MigrationsDir == "" || cfg.SnapshotPath == "" {
 		return errkind.New(errkind.KindConfiguration, "doctor: incomplete config; run `dorm init` to regenerate orm.json")
 	}
-	if cfg.Driver != postgres.New().Name() {
-		return errkind.New(errkind.KindUnsupportedFeature, fmt.Sprintf("doctor: unsupported driver %q; only postgres is supported", cfg.Driver))
+	drv, err := configuredDriver(cfg)
+	if err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "doctor: configure driver", err)
+	}
+	if cfg.Driver != drv.Name() {
+		return errkind.New(errkind.KindUnsupportedFeature, fmt.Sprintf("doctor: unsupported driver %q; only %s is supported", cfg.Driver, drv.Name()))
 	}
 	snapshot, err := schema.LoadSnapshot(filepath.Join(*root, cfg.SnapshotPath))
 	if err != nil {
@@ -461,7 +489,7 @@ func cmdDoctor(ctx context.Context, args []string) error {
 	if err := snapshot.Schema.Validate(); err != nil {
 		return errkind.Wrap(errkind.KindInvalidSchema, "doctor: snapshot integrity check failed", err)
 	}
-	db, err := openConfiguredDB(ctx, cfg)
+	db, err := openConfiguredDB(ctx, drv)
 	if err != nil {
 		return err
 	}
@@ -533,16 +561,40 @@ func jsonUnmarshal(data []byte, v any) error {
 	return json.Unmarshal(data, v)
 }
 
-func openConfiguredDB(ctx context.Context, cfg cliConfig) (*dorm.DB, error) {
+func openConfiguredDB(ctx context.Context, drv dormdriver.Driver) (*dorm.DB, error) {
+	if drv == nil {
+		return nil, errkind.New(errkind.KindConfiguration, "database driver is required")
+	}
+	return dorm.Open(ctx, drv)
+}
+
+func configuredDriver(cfg cliConfig) (dormdriver.Driver, error) {
 	if strings.TrimSpace(cfg.DSN) == "" {
 		return nil, errkind.New(errkind.KindConfiguration, "database DSN is required; set dsn in orm.json")
 	}
-	driver := driverpostgres.New(driverpostgres.Config{
+	drv := driverpostgres.New(driverpostgres.Config{
 		DSN:        cfg.DSN,
 		DriverName: cfg.Driver,
 	})
-	dorm.RegisterDriver(driver)
-	return dorm.Open(ctx, driver)
+	dorm.RegisterDriver(drv)
+	if registered := dorm.RegisteredDriver(); registered != nil {
+		return registered, nil
+	}
+	return drv, nil
+}
+
+func driverInspector(drv dormdriver.Driver) schema.Inspector {
+	if drv == nil {
+		drv = dorm.RegisteredDriver()
+	}
+	if drv == nil {
+		return nil
+	}
+	provider, ok := drv.(dormdriver.InspectorProvider)
+	if !ok {
+		return nil
+	}
+	return provider.Inspector()
 }
 
 func validateProjectPaths(root string, cfg cliConfig, requireModels bool) error {

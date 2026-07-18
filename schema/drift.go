@@ -54,7 +54,7 @@ func DetectDriftFromSource(ctx context.Context, root string, inspector Inspector
 			return err
 		}
 		if inspector == nil {
-			inspector = PostgresInspector{}
+			return dormerrors.NewValidationError("schema", "inspector", "schema inspector is required", nil)
 		}
 		actual, err := inspector.Inspect(ctx, db, schemaName)
 		if err != nil {

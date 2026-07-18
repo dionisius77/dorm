@@ -31,6 +31,7 @@ type Logger interface {
 type Config struct {
 	DB                  *sql.DB
 	Tx                  *sql.Tx
+	Context             context.Context
 	Dialect             dialect.Dialect
 	DriverName          string
 	Schema              *schema.Schema
@@ -90,7 +91,7 @@ func New(cfg Config) *DB {
 	return &DB{
 		db:                  cfg.DB,
 		tx:                  cfg.Tx,
-		ctx:                 context.Background(),
+		ctx:                 normalizeContext(cfg.Context),
 		dialect:             cfg.Dialect,
 		driverName:          cfg.DriverName,
 		schema:              cfg.Schema,
@@ -103,6 +104,13 @@ func New(cfg Config) *DB {
 		batchSize:           batchSize,
 		stmts:               map[string]*sql.Stmt{},
 	}
+}
+
+func normalizeContext(ctx context.Context) context.Context {
+	if ctx == nil {
+		return context.Background()
+	}
+	return ctx
 }
 
 func (db *DB) WithContext(ctx context.Context) *Session {
@@ -501,6 +509,9 @@ func (db *DB) Dialect() dialect.Dialect {
 }
 
 func (db *DB) PingContext(ctx context.Context) error {
+	if ctx == nil {
+		ctx = db.currentContext()
+	}
 	return db.traceOperation(ctx, "db.ping", []Attribute{{Key: "orm.operation", Value: "ping"}}, func(ctx context.Context) error {
 		if db == nil {
 			return errkind.New(errkind.KindConfiguration, "orm: nil db")
@@ -530,7 +541,7 @@ func (db *DB) Stats() sql.DBStats {
 }
 
 func (db *DB) Close() error {
-	return db.traceOperation(context.Background(), "db.close", []Attribute{{Key: "orm.operation", Value: "close"}}, func(context.Context) error {
+	return db.traceOperation(db.currentContext(), "db.close", []Attribute{{Key: "orm.operation", Value: "close"}}, func(context.Context) error {
 		if db == nil {
 			return nil
 		}
