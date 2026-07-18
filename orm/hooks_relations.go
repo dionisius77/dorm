@@ -96,6 +96,39 @@ func (s *Session) loadValue(rv reflect.Value, relation string) error {
 	}
 }
 
+func invokeBeforeFindHook(ctx context.Context, db *DB, model any) error {
+	return invokeLifecycleHook(ctx, db, "BeforeFind", model, func(context.Context) error {
+		if hook, ok := model.(BeforeFindHook); ok {
+			return hook.BeforeFind(ctx)
+		}
+		return nil
+	})
+}
+
+func beforeFindHookModel(dest any) any {
+	rv := reflect.ValueOf(dest)
+	if !rv.IsValid() {
+		return dest
+	}
+	for rv.Kind() == reflect.Pointer {
+		if rv.IsNil() {
+			return dest
+		}
+		rv = rv.Elem()
+	}
+	if rv.Kind() != reflect.Slice {
+		return dest
+	}
+	elem := rv.Type().Elem()
+	if elem.Kind() == reflect.Pointer {
+		elem = elem.Elem()
+	}
+	if elem.Kind() != reflect.Struct {
+		return dest
+	}
+	return reflect.New(elem).Interface()
+}
+
 func (s *Session) loadStructRelation(parent reflect.Value, relation string) error {
 	field, fieldInfo, ok := structFieldByName(parent, relation)
 	if !ok {
@@ -317,6 +350,9 @@ func invokeLifecycleHook(ctx context.Context, db *DB, hookName string, model any
 		return fn(ctx)
 	}
 	modelName := lifecycleHookModelName(model)
+	if db.dryRun != nil {
+		db.dryRun.recordHook(hookName, modelName)
+	}
 	spanName := "db.hook." + schema.ToSnakeCase(hookName)
 	return db.traceWithSpan(ctx, spanName, []Attribute{
 		{Key: "orm.hook", Value: hookName},

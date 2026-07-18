@@ -14,6 +14,27 @@ import (
 )
 
 type DB = orm.DB
+type DryRunSession = orm.DryRunSession
+type ExecutionReport = orm.ExecutionReport
+type ExecutionStatement = orm.ExecutionStatement
+type ExecutionStatus = orm.ExecutionStatus
+type AccessPolicyEvent = orm.AccessPolicyEvent
+type AccessPolicyEventKind = orm.AccessPolicyEventKind
+type AuditAction = orm.AuditAction
+type LifecycleHookEvent = orm.LifecycleHookEvent
+type QueryAdvisorFinding = orm.QueryAdvisorFinding
+type QueryAdvisorInput = orm.QueryAdvisorInput
+type QueryAdvisorReport = orm.QueryAdvisorReport
+type QueryAdvisor = orm.QueryAdvisor
+
+const (
+	ExecutionStatusSkipped             = orm.ExecutionStatusSkipped
+	AccessPolicyEventInjectedPredicate = orm.AccessPolicyEventInjectedPredicate
+	AccessPolicyEventInjectedField     = orm.AccessPolicyEventInjectedField
+	AccessPolicyEventInheritedPolicy   = orm.AccessPolicyEventInheritedPolicy
+	AccessPolicyEventPolicyOverride    = orm.AccessPolicyEventPolicyOverride
+	AccessPolicyEventSoftDelete        = orm.AccessPolicyEventSoftDelete
+)
 
 var (
 	ErrNotFound             = dormerrors.ErrNotFound

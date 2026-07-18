@@ -25,6 +25,7 @@ func (db *DB) traceWithSpan(ctx context.Context, spanName string, attrs []Attrib
 	if db == nil || !db.observability.Tracing {
 		return fn(ctx, nil)
 	}
+	spanName = db.traceSpanName(spanName)
 	attrs = append(baseSpanAttributes(db), attrs...)
 	if db.observability.TracerProvider != nil {
 		ctx, span := db.observability.TracerProvider.Tracer(otelInstrumentationName).Start(ctx, spanName)
@@ -65,6 +66,9 @@ func baseSpanAttributes(db *DB) []Attribute {
 	}
 	if db.dialect != nil {
 		attrs = append(attrs, Attribute{Key: "orm.dialect", Value: db.dialect.Name()})
+	}
+	if db.executionMode != executionModeNormal {
+		attrs = append(attrs, Attribute{Key: "orm.execution_mode", Value: string(db.executionMode)})
 	}
 	return attrs
 }

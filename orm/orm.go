@@ -37,6 +37,7 @@ type Config struct {
 	Logger              Logger
 	Observability       ObservabilityConfig
 	Access              access.Engine
+	QueryAdvisor        QueryAdvisor
 	PrepareStatements   bool
 	SoftDeleteByDefault bool
 	BatchSize           int
@@ -52,9 +53,12 @@ type DB struct {
 	logger              Logger
 	observability       ObservabilityConfig
 	access              access.Engine
+	queryAdvisor        QueryAdvisor
 	prepareStatements   bool
 	softDeleteByDefault bool
 	batchSize           int
+	executionMode       executionMode
+	dryRun              *dryRunRecorder
 	stmtMu              sync.Mutex
 	txMu                sync.Mutex
 	stmts               map[string]*sql.Stmt
@@ -62,6 +66,12 @@ type DB struct {
 }
 
 type Session struct {
+	db          *DB
+	ctx         context.Context
+	withDeleted bool
+}
+
+type DryRunSession struct {
 	db          *DB
 	ctx         context.Context
 	withDeleted bool
@@ -87,6 +97,7 @@ func New(cfg Config) *DB {
 		logger:              cfg.Logger,
 		observability:       obs,
 		access:              cfg.Access,
+		queryAdvisor:        cfg.QueryAdvisor,
 		prepareStatements:   cfg.PrepareStatements,
 		softDeleteByDefault: cfg.SoftDeleteByDefault,
 		batchSize:           batchSize,
@@ -96,6 +107,13 @@ func New(cfg Config) *DB {
 
 func (db *DB) WithContext(ctx context.Context) *Session {
 	return &Session{db: db, ctx: ctx}
+}
+
+func (db *DB) DryRun() *DryRunSession {
+	if db == nil {
+		return &DryRunSession{}
+	}
+	return &DryRunSession{db: db, ctx: db.currentContext()}
 }
 
 func (db *DB) WithPolicy(policy access.Policy) *Session {
@@ -129,8 +147,18 @@ func (s *Session) WithPolicy(policy access.Policy) *Session {
 	return &cp
 }
 
+func (s *Session) DryRun() *DryRunSession {
+	if s == nil {
+		return &DryRunSession{}
+	}
+	return &DryRunSession{db: s.db, ctx: s.ctx, withDeleted: s.withDeleted}
+}
+
 func (s *Session) Find(dest any, opts ...QueryOption) error {
 	return s.db.traceOperation(s.ctx, "db.query", []Attribute{{Key: "orm.operation", Value: "find"}}, func(ctx context.Context) error {
+		if err := invokeBeforeFindHook(ctx, s.db, beforeFindHookModel(dest)); err != nil {
+			return err
+		}
 		state, err := s.buildState(dest, opts...)
 		if err != nil {
 			return err
@@ -171,6 +199,10 @@ func (s *Session) Count(model any, opts ...QueryOption) (int64, error) {
 		meta, _, err := s.db.resolveModel(model)
 		if err != nil {
 			return err
+		}
+		if s.db.dryRun != nil {
+			s.db.dryRun.setTable(meta.table.Name)
+			s.db.dryRun.setOperation("count")
 		}
 		state := &queryState{table: meta.table}
 		if s.withDeleted {
@@ -234,13 +266,17 @@ func (s *Session) create(ctx context.Context, model any) error {
 	if err != nil {
 		return err
 	}
+	if s.db.dryRun != nil {
+		s.db.dryRun.setTable(meta.table.Name)
+		s.db.dryRun.setOperation("create")
+	}
 	now := time.Now().UTC()
 	table := meta.table
 	values := map[string]any{}
-	if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpInsert); err != nil {
+	if err := populateAuditAndScope(s.db, ctx, table, rv, values, now, access.OpInsert); err != nil {
 		return err
 	}
-	if err := applyStructFieldValues(ctx, table, rv, values, now, true); err != nil {
+	if err := applyStructFieldValues(s.db, ctx, table, rv, values, now, true); err != nil {
 		return err
 	}
 	cols, args := orderedColumnsAndArgs(table, values, true)
@@ -280,13 +316,17 @@ func (s *Session) update(ctx context.Context, model any, opts []QueryOption, use
 	if err != nil {
 		return err
 	}
+	if s.db.dryRun != nil {
+		s.db.dryRun.setTable(meta.table.Name)
+		s.db.dryRun.setOperation("update")
+	}
 	now := time.Now().UTC()
 	table := meta.table
 	values := map[string]any{}
-	if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpUpdate); err != nil {
+	if err := populateAuditAndScope(s.db, ctx, table, rv, values, now, access.OpUpdate); err != nil {
 		return err
 	}
-	if err := applyStructFieldValues(ctx, table, rv, values, now, false); err != nil {
+	if err := applyStructFieldValues(s.db, ctx, table, rv, values, now, false); err != nil {
 		return err
 	}
 	setPkCols := primaryKeyColumnNames(table)
@@ -347,6 +387,10 @@ func (s *Session) SoftDelete(model any) error {
 		if err != nil {
 			return err
 		}
+		if s.db.dryRun != nil {
+			s.db.dryRun.setTable(meta.table.Name)
+			s.db.dryRun.setOperation("soft_delete")
+		}
 		table := meta.table
 		soft := softDeleteColumn(table)
 		if soft == nil {
@@ -366,12 +410,16 @@ func (s *Session) Upsert(model any) error {
 		if err != nil {
 			return err
 		}
+		if s.db.dryRun != nil {
+			s.db.dryRun.setTable(meta.table.Name)
+			s.db.dryRun.setOperation("upsert")
+		}
 		table := meta.table
 		values := map[string]any{}
-		if err := applyStructFieldValues(ctx, table, rv, values, time.Now().UTC(), true); err != nil {
+		if err := applyStructFieldValues(s.db, ctx, table, rv, values, time.Now().UTC(), true); err != nil {
 			return err
 		}
-		if err := populateAuditAndScope(ctx, table, rv, values, time.Now().UTC(), access.OpInsert); err != nil {
+		if err := populateAuditAndScope(s.db, ctx, table, rv, values, time.Now().UTC(), access.OpInsert); err != nil {
 			return err
 		}
 		cols, args := orderedColumnsAndArgs(table, values, true)
@@ -506,6 +554,10 @@ func (s *Session) buildState(dest any, opts ...QueryOption) (*queryState, error)
 		return nil, err
 	}
 	s.db.logPolicyOverride(s.ctx)
+	if s.db.dryRun != nil {
+		s.db.dryRun.setTable(meta.table.Name)
+		s.db.dryRun.setOperation("find")
+	}
 	state := &queryState{table: meta.table, columns: columnsForTable(meta.table)}
 	if s.withDeleted {
 		state.withDeleted = true
@@ -514,11 +566,23 @@ func (s *Session) buildState(dest any, opts ...QueryOption) (*queryState, error)
 		opt(state)
 	}
 	if !state.withDeleted && access.PolicyFromContext(s.ctx).EnforcesSoftDelete() && softDeleteColumn(meta.table) != nil {
-		state.where = append(state.where, predicate{expr: softDeleteColumn(meta.table).Name + " IS NULL"})
+		soft := softDeleteColumn(meta.table)
+		state.where = append(state.where, predicate{expr: soft.Name + " IS NULL"})
+		if s.db.dryRun != nil {
+			s.db.dryRun.recordAccessPolicy(AccessPolicyEvent{
+				Kind:        AccessPolicyEventSoftDelete,
+				Field:       soft.Name,
+				SQL:         soft.Name + " IS NULL",
+				Description: "soft delete predicate injected",
+			})
+		}
 	}
 	preds, _, err := s.db.access.Apply(s.ctx, meta.table, access.OpQuery, nil)
 	if err != nil {
 		return nil, err
+	}
+	if s.db.dryRun != nil {
+		recordAccessPredicateEvents(s.db.dryRun, meta.table, access.OpQuery, preds, access.PolicyFromContext(s.ctx))
 	}
 	for _, pred := range preds {
 		state.where = append(state.where, predicate{expr: pred.SQL, args: pred.Args})
@@ -794,7 +858,7 @@ func setFloat(dst reflect.Value, value any) {
 	}
 }
 
-func populateAuditAndScope(ctx context.Context, table *schema.Table, rv reflect.Value, values map[string]any, now time.Time, op access.Operation) error {
+func populateAuditAndScope(db *DB, ctx context.Context, table *schema.Table, rv reflect.Value, values map[string]any, now time.Time, op access.Operation) error {
 	preds, writes, err := access.NewEngine().Apply(ctx, table, op, nil)
 	_ = preds
 	if err != nil {
@@ -803,6 +867,27 @@ func populateAuditAndScope(ctx context.Context, table *schema.Table, rv reflect.
 	for _, w := range writes {
 		values[w.Field] = w.Value
 		setFieldByColumn(rv, table, w.Field, w.Value)
+		if db != nil && db.dryRun != nil {
+			if col := columnByName(table, w.Field); col != nil {
+				switch {
+				case col.Scope != schema.ScopeNone:
+					db.dryRun.recordAccessPolicy(AccessPolicyEvent{
+						Kind:        AccessPolicyEventInjectedField,
+						Field:       w.Field,
+						SQL:         w.Field + " = ?",
+						Arguments:   []any{w.Value},
+						Description: "scoped field injected by access policy",
+					})
+				case col.CreatedBy || col.UpdatedBy || col.DeletedBy:
+					db.dryRun.recordAuditAction(AuditAction{
+						Field:       w.Field,
+						Value:       w.Value,
+						Kind:        "user",
+						Description: "audit field injected by access policy",
+					})
+				}
+			}
+		}
 	}
 	for _, col := range table.Columns {
 		if !access.PolicyFromContext(ctx).EnforcesAudit() {
@@ -812,18 +897,42 @@ func populateAuditAndScope(ctx context.Context, table *schema.Table, rv reflect.
 		case col.CreatedAt && op == access.OpInsert:
 			values[col.Name] = now
 			setFieldByColumn(rv, table, col.Name, now)
+			if db != nil && db.dryRun != nil {
+				db.dryRun.recordAuditAction(AuditAction{
+					Field:       col.Name,
+					Value:       now,
+					Kind:        "timestamp",
+					Description: "created timestamp injected",
+				})
+			}
 		case col.UpdatedAt:
 			values[col.Name] = now
 			setFieldByColumn(rv, table, col.Name, now)
+			if db != nil && db.dryRun != nil {
+				db.dryRun.recordAuditAction(AuditAction{
+					Field:       col.Name,
+					Value:       now,
+					Kind:        "timestamp",
+					Description: "updated timestamp injected",
+				})
+			}
 		case col.DeletedAt && op == access.OpDelete:
 			values[col.Name] = now
 			setFieldByColumn(rv, table, col.Name, now)
+			if db != nil && db.dryRun != nil {
+				db.dryRun.recordAuditAction(AuditAction{
+					Field:       col.Name,
+					Value:       now,
+					Kind:        "timestamp",
+					Description: "deleted timestamp injected",
+				})
+			}
 		}
 	}
 	return nil
 }
 
-func applyStructFieldValues(ctx context.Context, table *schema.Table, rv reflect.Value, values map[string]any, now time.Time, isInsert bool) error {
+func applyStructFieldValues(db *DB, ctx context.Context, table *schema.Table, rv reflect.Value, values map[string]any, now time.Time, isInsert bool) error {
 	if !access.PolicyFromContext(ctx).EnforcesAudit() {
 		return nil
 	}
@@ -841,12 +950,36 @@ func applyStructFieldValues(ctx context.Context, table *schema.Table, rv reflect
 			case col.CreatedAt && isInsert:
 				values[col.Name] = now
 				setFieldByColumn(rv, table, col.Name, now)
+				if db != nil && db.dryRun != nil {
+					db.dryRun.recordAuditAction(AuditAction{
+						Field:       col.Name,
+						Value:       now,
+						Kind:        "timestamp",
+						Description: "created timestamp injected",
+					})
+				}
 			case col.UpdatedAt:
 				values[col.Name] = now
 				setFieldByColumn(rv, table, col.Name, now)
+				if db != nil && db.dryRun != nil {
+					db.dryRun.recordAuditAction(AuditAction{
+						Field:       col.Name,
+						Value:       now,
+						Kind:        "timestamp",
+						Description: "updated timestamp injected",
+					})
+				}
 			case col.DeletedAt && !isInsert:
 				values[col.Name] = now
 				setFieldByColumn(rv, table, col.Name, now)
+				if db != nil && db.dryRun != nil {
+					db.dryRun.recordAuditAction(AuditAction{
+						Field:       col.Name,
+						Value:       now,
+						Kind:        "timestamp",
+						Description: "deleted timestamp injected",
+					})
+				}
 			case col.CreatedBy || col.UpdatedBy || col.DeletedBy || col.Scope != schema.ScopeNone:
 				// already handled by access layer if context exists
 			default:
@@ -963,6 +1096,55 @@ func accessPredicates(ctx context.Context, table *schema.Table) []predicate {
 	return clauses
 }
 
+func recordAccessPredicateEvents(recorder *dryRunRecorder, table *schema.Table, op access.Operation, preds []access.Predicate, policy access.Policy) {
+	if recorder == nil || table == nil || len(preds) == 0 {
+		return
+	}
+	scopeColumns := scopedColumnsForOperation(table, op, policy)
+	for i, pred := range preds {
+		field := ""
+		if i < len(scopeColumns) {
+			field = scopeColumns[i].Name
+		}
+		recorder.recordAccessPolicy(AccessPolicyEvent{
+			Kind:        AccessPolicyEventInjectedPredicate,
+			Field:       field,
+			SQL:         pred.SQL,
+			Arguments:   append([]any(nil), pred.Args...),
+			Description: "access predicate injected",
+		})
+	}
+}
+
+func scopedColumnsForOperation(table *schema.Table, op access.Operation, policy access.Policy) []*schema.Column {
+	if table == nil {
+		return nil
+	}
+	var cols []*schema.Column
+	for _, col := range table.Columns {
+		if col == nil || col.Scope == schema.ScopeNone || !policy.AllowsScope(col.Scope) {
+			continue
+		}
+		switch op {
+		case access.OpQuery, access.OpDelete:
+			cols = append(cols, col)
+		}
+	}
+	return cols
+}
+
+func columnByName(table *schema.Table, name string) *schema.Column {
+	if table == nil {
+		return nil
+	}
+	for _, col := range table.Columns {
+		if col != nil && col.Name == name {
+			return col
+		}
+	}
+	return nil
+}
+
 func softDeleteColumn(table *schema.Table) *schema.Column {
 	return access.SoftDeleteColumn(table)
 }
@@ -970,11 +1152,19 @@ func softDeleteColumn(table *schema.Table) *schema.Column {
 func (s *Session) softDelete(ctx context.Context, model any, table *schema.Table, rv reflect.Value, soft *schema.Column) error {
 	now := time.Now().UTC()
 	values := map[string]any{}
-	if err := populateAuditAndScope(ctx, table, rv, values, now, access.OpDelete); err != nil {
+	if err := populateAuditAndScope(s.db, ctx, table, rv, values, now, access.OpDelete); err != nil {
 		return err
 	}
 	values[soft.Name] = now
 	setFieldByColumn(rv, table, soft.Name, now)
+	if s.db != nil && s.db.dryRun != nil {
+		s.db.dryRun.recordAuditAction(AuditAction{
+			Field:       soft.Name,
+			Value:       now,
+			Kind:        "timestamp",
+			Description: "soft delete timestamp injected",
+		})
+	}
 	pkCols, pkArgs, err := primaryKeyValues(table, rv)
 	if err != nil {
 		return err
@@ -1004,6 +1194,10 @@ func (s *Session) delete(ctx context.Context, model any) error {
 	meta, rv, err := s.resolveModel(model)
 	if err != nil {
 		return err
+	}
+	if s.db.dryRun != nil {
+		s.db.dryRun.setTable(meta.table.Name)
+		s.db.dryRun.setOperation("delete")
 	}
 	table := meta.table
 	if soft := softDeleteColumn(table); soft != nil && access.PolicyFromContext(ctx).EnforcesSoftDelete() {
@@ -1373,10 +1567,27 @@ func (db *DB) execReturning(ctx context.Context, sqlText string, args []any, mod
 
 func (db *DB) logPolicyOverride(ctx context.Context) {
 	if db == nil || db.logger == nil {
-		return
+		// still allow dry-run recording below
 	}
 	policy := access.PolicyFromContext(ctx)
+	if db != nil && db.dryRun != nil {
+		db.dryRun.recordAccessPolicy(AccessPolicyEvent{
+			Kind:        AccessPolicyEventInheritedPolicy,
+			Policy:      policy.Name(),
+			Description: "active access policy from context",
+		})
+		if !policy.IsDefault() {
+			db.dryRun.recordAccessPolicy(AccessPolicyEvent{
+				Kind:        AccessPolicyEventPolicyOverride,
+				Policy:      policy.Name(),
+				Description: "policy override applied",
+			})
+		}
+	}
 	if policy.IsDefault() {
+		return
+	}
+	if db == nil || db.logger == nil {
 		return
 	}
 	db.logger.Printf("access policy override: %s", policy.Name())

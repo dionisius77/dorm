@@ -191,3 +191,13 @@ func (c ObservabilityConfig) ShouldMask(field string) bool {
 	}
 	return false
 }
+
+func (db *DB) traceSpanName(spanName string) string {
+	if db == nil || db.executionMode == executionModeNormal {
+		return spanName
+	}
+	if strings.HasPrefix(spanName, "db.") {
+		return "db.inspect." + strings.TrimPrefix(spanName, "db.")
+	}
+	return "db.inspect." + spanName
+}

@@ -1,6 +1,7 @@
 package main
 
 import (
+	"bytes"
 	"context"
 	"database/sql"
 	"encoding/json"
@@ -47,6 +48,8 @@ func run(ctx context.Context, args []string) error {
 		return cmdSeed(ctx, args[1:])
 	case "analyze":
 		return cmdAnalyze(ctx, args[1:])
+	case "dry-run":
+		return cmdDryRun(args[1:])
 	case "doctor":
 		return cmdDoctor(ctx, args[1:])
 	default:
@@ -601,6 +604,7 @@ func printRootHelp(w io.Writer) {
 	fmt.Fprintln(w, "  schema    Check schema drift against source")
 	fmt.Fprintln(w, "  seed      Run, list, or reset registered seeders")
 	fmt.Fprintln(w, "  analyze   Analyze SQL and suggest query improvements")
+	fmt.Fprintln(w, "  dry-run   Render a Dry Run execution report")
 	fmt.Fprintln(w, "  doctor    Validate project and database readiness")
 	fmt.Fprintln(w, "")
 	fmt.Fprintln(w, "Examples:")
@@ -655,6 +659,38 @@ func cmdAnalyze(ctx context.Context, args []string) error {
 		return errkind.Wrap(errkind.KindRuntimeQuery, "analyze: analyze sql", err)
 	}
 	fmt.Fprintln(os.Stdout, report.String())
+	return nil
+}
+
+func cmdDryRun(args []string) error {
+	fs := newFlagSet("dry-run")
+	reportFile := fs.String("report", "", "execution report JSON file")
+	fs.Usage = func() { printDryRunHelp(os.Stdout) }
+	if err := fs.Parse(args); err != nil {
+		return handleFlagError(fs, err)
+	}
+	var data []byte
+	var err error
+	if strings.TrimSpace(*reportFile) != "" {
+		data, err = os.ReadFile(*reportFile)
+		if err != nil {
+			return errkind.Wrap(errkind.KindConfiguration, "dry-run: read report", err)
+		}
+	} else {
+		data, err = io.ReadAll(os.Stdin)
+		if err != nil {
+			return errkind.Wrap(errkind.KindConfiguration, "dry-run: read stdin", err)
+		}
+	}
+	if len(bytes.TrimSpace(data)) == 0 {
+		printDryRunHelp(os.Stdout)
+		return nil
+	}
+	var report dorm.ExecutionReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		return errkind.Wrap(errkind.KindConfiguration, "dry-run: decode report", err)
+	}
+	fmt.Fprint(os.Stdout, formatDryRunReport(report))
 	return nil
 }
 
@@ -859,6 +895,109 @@ func printAnalyzeHelp(w io.Writer) {
 	fmt.Fprintln(w, "Examples:")
 	fmt.Fprintln(w, "  dorm analyze --root . --sql \"SELECT * FROM users WHERE email = $1\"")
 	fmt.Fprintln(w, "  dorm analyze --root . --table users --sql-file query.sql")
+}
+
+func printDryRunHelp(w io.Writer) {
+	fmt.Fprintln(w, "dorm dry-run")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Purpose:")
+	fmt.Fprintln(w, "  Render a Dry Run execution report in a human-readable format.")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Usage:")
+	fmt.Fprintln(w, "  dorm dry-run --report <report.json>")
+	fmt.Fprintln(w, "  cat report.json | dorm dry-run")
+	fmt.Fprintln(w, "")
+	fmt.Fprintln(w, "Flags:")
+	fmt.Fprintln(w, "  --report string   execution report JSON file")
+}
+
+func formatDryRunReport(report dorm.ExecutionReport) string {
+	var b strings.Builder
+	writeDryRunSection(&b, "Access Policy")
+	if len(report.AccessPolicies) == 0 {
+		fmt.Fprintln(&b, "(none)")
+	} else {
+		for _, event := range report.AccessPolicies {
+			switch event.Kind {
+			case dorm.AccessPolicyEventSoftDelete:
+				if event.Field != "" {
+					fmt.Fprintf(&b, "✓ %s injected\n", event.Field)
+				} else {
+					fmt.Fprintln(&b, "✓ soft delete injected")
+				}
+			case dorm.AccessPolicyEventInjectedField, dorm.AccessPolicyEventInjectedPredicate:
+				if event.Field != "" {
+					fmt.Fprintf(&b, "✓ %s injected\n", event.Field)
+				} else if event.SQL != "" {
+					fmt.Fprintf(&b, "✓ %s\n", event.SQL)
+				}
+			case dorm.AccessPolicyEventPolicyOverride:
+				fmt.Fprintf(&b, "✓ policy override: %s\n", event.Policy)
+			case dorm.AccessPolicyEventInheritedPolicy:
+				fmt.Fprintf(&b, "✓ policy: %s\n", event.Policy)
+			}
+		}
+	}
+	writeDryRunSection(&b, "Generated SQL")
+	if strings.TrimSpace(report.SQL) == "" {
+		fmt.Fprintln(&b, "(none)")
+	} else {
+		fmt.Fprintln(&b, report.SQL)
+	}
+	writeDryRunSection(&b, "Parameters")
+	if len(report.Parameters) == 0 {
+		fmt.Fprintln(&b, "(none)")
+	} else {
+		for i, param := range report.Parameters {
+			fmt.Fprintf(&b, "$%d = %v\n", i+1, param)
+		}
+	}
+	writeDryRunSection(&b, "Audit Actions")
+	if len(report.AuditActions) == 0 {
+		fmt.Fprintln(&b, "(none)")
+	} else {
+		for _, action := range report.AuditActions {
+			fmt.Fprintf(&b, "✓ %s\n", action.Field)
+		}
+	}
+	writeDryRunSection(&b, "Lifecycle Hooks")
+	if len(report.LifecycleHooks) == 0 {
+		fmt.Fprintln(&b, "(none)")
+	} else {
+		for _, hook := range report.LifecycleHooks {
+			fmt.Fprintf(&b, "✓ %s\n", hook.Name)
+		}
+	}
+	writeDryRunSection(&b, "Query Advisor")
+	if len(report.QueryAdvisor) == 0 {
+		fmt.Fprintln(&b, "(none)")
+	} else {
+		for _, finding := range report.QueryAdvisor {
+			title := finding.Title
+			if title == "" {
+				title = finding.Code
+			}
+			fmt.Fprintf(&b, "⚠ %s\n", title)
+			if finding.Recommendation != "" {
+				fmt.Fprintf(&b, "%s\n", finding.Recommendation)
+			}
+		}
+	}
+	writeDryRunSection(&b, "Execution")
+	if report.ExecutionStatus == "" {
+		fmt.Fprintln(&b, string(dorm.ExecutionStatusSkipped))
+	} else {
+		fmt.Fprintln(&b, report.ExecutionStatus)
+	}
+	return b.String()
+}
+
+func writeDryRunSection(b *strings.Builder, title string) {
+	if b.Len() > 0 {
+		b.WriteString("\n")
+	}
+	fmt.Fprintln(b, title)
+	fmt.Fprintln(b, "")
 }
 
 func printDoctorHelp(w io.Writer) {

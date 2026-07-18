@@ -8,8 +8,8 @@ import (
 	"strconv"
 	"strings"
 
-	"github.com/dionisius77/dorm/orm"
 	"github.com/dionisius77/dorm/errkind"
+	"github.com/dionisius77/dorm/orm"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -34,20 +34,20 @@ const (
 )
 
 type Finding struct {
-	Code            string
-	Rule            string
-	Severity        Severity
-	Title           string
-	Details         string
-	Recommendation  string
-	Table           string
-	Columns         []string
+	Code           string
+	Rule           string
+	Severity       Severity
+	Title          string
+	Details        string
+	Recommendation string
+	Table          string
+	Columns        []string
 }
 
 type Report struct {
-	Table   string
-	Kind    QueryKind
-	SQL     string
+	Table    string
+	Kind     QueryKind
+	SQL      string
 	Findings []Finding
 }
 
@@ -163,6 +163,36 @@ func (a *Analyzer) Analyze(ctx context.Context, input Input) (Report, error) {
 		return Report{}, err
 	}
 	return report, nil
+}
+
+// Inspect adapts the analyzer to the ORM query advisor interface.
+func (a *Analyzer) Inspect(ctx context.Context, input orm.QueryAdvisorInput) (orm.QueryAdvisorReport, error) {
+	report, err := a.Analyze(ctx, Input{
+		SQL:    input.SQL,
+		Table:  input.Table,
+		Schema: input.Schema,
+	})
+	if err != nil {
+		return orm.QueryAdvisorReport{}, err
+	}
+	out := orm.QueryAdvisorReport{
+		Table: report.Table,
+		SQL:   report.SQL,
+		Kind:  string(report.Kind),
+	}
+	for _, finding := range report.Findings {
+		out.Findings = append(out.Findings, orm.QueryAdvisorFinding{
+			Code:           finding.Code,
+			Rule:           finding.Rule,
+			Severity:       string(finding.Severity),
+			Title:          finding.Title,
+			Details:        finding.Details,
+			Recommendation: finding.Recommendation,
+			Table:          finding.Table,
+			Columns:        append([]string(nil), finding.Columns...),
+		})
+	}
+	return out, nil
 }
 
 func (a *Analyzer) buildContext(input Input) (ParsedQuery, *schema.Table, error) {

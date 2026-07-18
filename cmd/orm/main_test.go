@@ -5,6 +5,7 @@ import (
 	"context"
 	"database/sql"
 	"database/sql/driver"
+	"encoding/json"
 	"fmt"
 	"io"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/dionisius77/dorm"
 	"github.com/dionisius77/dorm/schema"
 )
 
@@ -343,7 +345,47 @@ func TestRootHelpPrintsUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, want := range []string{"Usage:", "migrate", "schema", "seed", "analyze", "doctor"} {
+	for _, want := range []string{"Usage:", "migrate", "schema", "seed", "analyze", "dry-run", "doctor"} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("expected %q in output, got %q", want, out)
+		}
+	}
+}
+
+func TestDryRunCommandRendersReport(t *testing.T) {
+	report := dorm.ExecutionReport{
+		ExecutionStatus: dorm.ExecutionStatusSkipped,
+		SQL:             "SELECT * FROM users WHERE company_id = $1",
+		Parameters:      []any{"company-1"},
+		AccessPolicies: []dorm.AccessPolicyEvent{
+			{Kind: dorm.AccessPolicyEventInjectedPredicate, Field: "company_id"},
+			{Kind: dorm.AccessPolicyEventSoftDelete, Field: "deleted_at"},
+		},
+		AuditActions: []dorm.AuditAction{
+			{Field: "created_at"},
+		},
+		LifecycleHooks: []dorm.LifecycleHookEvent{
+			{Name: "BeforeFind"},
+		},
+		QueryAdvisor: []dorm.QueryAdvisorFinding{
+			{Title: "Missing composite index", Recommendation: "(company_id, deleted_at)"},
+		},
+	}
+	data, err := json.Marshal(report)
+	if err != nil {
+		t.Fatal(err)
+	}
+	path := filepath.Join(t.TempDir(), "report.json")
+	if err := os.WriteFile(path, data, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	out, err := captureStdout(func() error {
+		return cmdDryRun([]string{"--report", path})
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, want := range []string{"Access Policy", "Generated SQL", "Audit Actions", "Lifecycle Hooks", "Query Advisor", "Execution", "Skipped"} {
 		if !strings.Contains(out, want) {
 			t.Fatalf("expected %q in output, got %q", want, out)
 		}
