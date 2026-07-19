@@ -195,7 +195,7 @@ func traceConnectionOperation(ctx context.Context, obs orm.ObservabilityConfig, 
 		err := fn(ctx)
 		if err != nil {
 			span.RecordError(err)
-			span.SetAttributes(orm.Attribute{Key: "orm.status", Value: "error"})
+			setConnectionSpanStatus(span, err)
 		}
 		span.End()
 		return err
@@ -214,13 +214,14 @@ func traceConnectionOperation(ctx context.Context, obs orm.ObservabilityConfig, 
 func connectionSpanAttributes(drv driver.Driver, spanName string) []orm.Attribute {
 	attrs := []orm.Attribute{
 		{Key: "orm.operation", Value: connectionOperationName(spanName)},
+		{Key: "db.operation", Value: connectionOperationName(spanName)},
 	}
 	if drv == nil {
 		return attrs
 	}
 	attrs = append(attrs,
-		orm.Attribute{Key: "orm.driver", Value: drv.Name()},
-		orm.Attribute{Key: "orm.dialect", Value: drv.Dialect().Name()},
+		orm.Attribute{Key: "driver.name", Value: drv.Name()},
+		orm.Attribute{Key: "driver.dialect", Value: drv.Dialect().Name()},
 	)
 	if provider, ok := drv.(driver.ConnectionInfoProvider); ok {
 		info := provider.ConnectionInfo()
@@ -241,6 +242,17 @@ func connectionSpanAttributes(drv driver.Driver, spanName string) []orm.Attribut
 		}
 	}
 	return attrs
+}
+
+func setConnectionSpanStatus(span orm.Span, err error) {
+	if span == nil || err == nil {
+		return
+	}
+	if statusSetter, ok := span.(interface {
+		SetStatus(otelcodes.Code, string)
+	}); ok {
+		statusSetter.SetStatus(otelcodes.Error, err.Error())
+	}
 }
 
 func connectionOperationName(spanName string) string {

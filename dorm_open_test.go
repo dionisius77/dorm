@@ -12,6 +12,12 @@ import (
 	"sync"
 	"testing"
 
+	"go.opentelemetry.io/otel"
+	otelattribute "go.opentelemetry.io/otel/attribute"
+	otelcodes "go.opentelemetry.io/otel/codes"
+	oteltrace "go.opentelemetry.io/otel/trace"
+	"go.opentelemetry.io/otel/trace/embedded"
+
 	"github.com/dionisius77/dorm/dialect"
 	pgdialect "github.com/dionisius77/dorm/dialect/postgres"
 	dormdriver "github.com/dionisius77/dorm/driver"
@@ -336,10 +342,6 @@ func TestOpenRunsPreflightWhenEnabled(t *testing.T) {
 	modelRoot := filepath.Join(root, "models")
 	writeOpenTestModel(t, modelRoot)
 	snapshotPath := writeOpenTestSnapshot(t, modelRoot)
-	snap, err := schema.LoadSnapshot(snapshotPath)
-	if err != nil {
-		t.Fatal(err)
-	}
 
 	scenario := "success"
 	state := openTestStateFor(scenario)
@@ -347,7 +349,11 @@ func TestOpenRunsPreflightWhenEnabled(t *testing.T) {
 	state.closed = 0
 	state.queries = nil
 	state.mu.Unlock()
-	inspector := &staticSchemaInspector{schema: snap.Schema}
+	provider := &openTestTracerProvider{}
+	schemaProvider := &openOtelTracerProvider{}
+	prev := otel.GetTracerProvider()
+	otel.SetTracerProvider(schemaProvider)
+	t.Cleanup(func() { otel.SetTracerProvider(prev) })
 
 	db, err := Open(context.Background(), testOpenDriver{
 		scenario: scenario,
@@ -357,15 +363,30 @@ func TestOpenRunsPreflightWhenEnabled(t *testing.T) {
 			SnapshotPath: snapshotPath,
 			SchemaName:   "public",
 		},
-		inspector: inspector,
-	})
+		inspector: schema.PostgresInspector{},
+	}, WithObservability(orm.ObservabilityConfig{
+		Tracing:        true,
+		TracerProvider: provider,
+		SQLLogging:     orm.SQLLogDisabled,
+		TraceSQL:       orm.TraceSQLDisabled,
+	}))
 	if err != nil {
 		t.Fatal(err)
 	}
 	defer db.Close()
 
-	if inspector.calls == 0 {
-		t.Fatal("expected preflight inspector to run")
+	for _, want := range []string{"db.connect", "db.ping"} {
+		if !containsOpenSpan(provider.spanNames, want) {
+			t.Fatalf("expected span %q in %v", want, provider.spanNames)
+		}
+	}
+	if !hasOpenSpanAttribute(provider.attrs, "db.connect", "driver.name", "postgres") {
+		t.Fatalf("expected driver metadata on connect span, got %#v", provider.attrs)
+	}
+	for _, want := range []string{"db.schema.check", "db.schema.build", "db.schema.inspect"} {
+		if !containsOpenSpan(schemaProvider.spanNames, want) {
+			t.Fatalf("expected schema span %q in %v", want, schemaProvider.spanNames)
+		}
 	}
 }
 
@@ -442,6 +463,25 @@ func TestOpenAppliesObservabilityConfig(t *testing.T) {
 	}
 	if provider.spans == 0 {
 		t.Fatal("expected observability tracer to be used")
+	}
+}
+
+func TestOpenSkipsSpansWhenObservabilityDisabled(t *testing.T) {
+	provider := &openTestTracerProvider{}
+	db, err := Open(context.Background(), testOpenDriver{
+		scenario: "disabled-spans",
+	}, WithObservability(orm.ObservabilityConfig{
+		Tracing:        false,
+		TracerProvider: provider,
+		SQLLogging:     orm.SQLLogDisabled,
+		TraceSQL:       orm.TraceSQLDisabled,
+	}))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer db.Close()
+	if provider.spans != 0 {
+		t.Fatalf("expected no spans when tracing is disabled, got %#v", provider.spanNames)
 	}
 }
 
@@ -552,3 +592,64 @@ func TestOpenEmitsConnectionLifecycleSpans(t *testing.T) {
 		}
 	}
 }
+
+func containsOpenSpan(names []string, want string) bool {
+	for _, got := range names {
+		if got == want {
+			return true
+		}
+	}
+	return false
+}
+
+func hasOpenSpanAttribute(attrs [][]orm.Attribute, spanName, key string, value any) bool {
+	for i, attrSet := range attrs {
+		if i >= len(attrSet) {
+			continue
+		}
+		_ = spanName
+		for _, attr := range attrSet {
+			if attr.Key == key && attr.Value == value {
+				return true
+			}
+		}
+	}
+	return false
+}
+
+type openOtelTracerProvider struct {
+	embedded.TracerProvider
+	mu        sync.Mutex
+	spanNames []string
+}
+
+type openOtelTracer struct {
+	embedded.Tracer
+	provider *openOtelTracerProvider
+}
+
+type openOtelSpan struct {
+	embedded.Span
+}
+
+func (p *openOtelTracerProvider) Tracer(string, ...oteltrace.TracerOption) oteltrace.Tracer {
+	return openOtelTracer{provider: p}
+}
+
+func (t openOtelTracer) Start(ctx context.Context, name string, _ ...oteltrace.SpanStartOption) (context.Context, oteltrace.Span) {
+	t.provider.mu.Lock()
+	t.provider.spanNames = append(t.provider.spanNames, name)
+	t.provider.mu.Unlock()
+	return ctx, openOtelSpan{}
+}
+
+func (openOtelSpan) End(...oteltrace.SpanEndOption) {}
+func (openOtelSpan) IsRecording() bool { return false }
+func (openOtelSpan) RecordError(error, ...oteltrace.EventOption) {}
+func (openOtelSpan) SpanContext() oteltrace.SpanContext { return oteltrace.SpanContext{} }
+func (openOtelSpan) SetStatus(otelcodes.Code, string) {}
+func (openOtelSpan) SetName(string) {}
+func (openOtelSpan) SetAttributes(...otelattribute.KeyValue) {}
+func (openOtelSpan) AddEvent(string, ...oteltrace.EventOption) {}
+func (openOtelSpan) AddLink(oteltrace.Link) {}
+func (openOtelSpan) TracerProvider() oteltrace.TracerProvider { return nil }

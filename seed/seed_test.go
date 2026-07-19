@@ -6,6 +6,7 @@ import (
 	"database/sql/driver"
 	"fmt"
 	"io"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -149,6 +150,7 @@ func seedTestLastQuery() string {
 
 func TestSyncCreatesMissingRecord(t *testing.T) {
 	seedTestReset()
+	provider := &seedTestTracerProvider{}
 	dbConn, err := sql.Open("seed-test", "")
 	if err != nil {
 		t.Fatal(err)
@@ -173,6 +175,10 @@ func TestSyncCreatesMissingRecord(t *testing.T) {
 				},
 			},
 		},
+		Observability: orm.ObservabilityConfig{
+			Tracing:        true,
+			TracerProvider: provider,
+		},
 	})
 
 	type Role struct {
@@ -183,12 +189,21 @@ func TestSyncCreatesMissingRecord(t *testing.T) {
 		UpdatedAt time.Time
 	}
 
-	if err := Sync(context.Background(), db, &Role{Code: "ADMIN", Name: "Administrator"}, Key("Code")); err != nil {
+	if err := Sync(context.Background(), db, &Role{ID: 1, Code: "ADMIN", Name: "Administrator"}, Key("Code")); err != nil {
 		t.Fatal(err)
 	}
 	query := strings.ToLower(seedTestLastQuery())
 	if !strings.Contains(query, `insert into "roles"`) {
 		t.Fatalf("expected insert query, got %q", query)
+	}
+	if !seedHasSpan(provider.spans, "seed.sync") {
+		t.Fatalf("expected seed sync span, got %#v", provider.spans)
+	}
+	if got := seedSpanInt64Attr(provider, "seed.sync", "seed.records_inserted"); got != 1 {
+		t.Fatalf("expected one inserted record, got %#v", got)
+	}
+	if got := seedSpanAttr(provider, "seed.sync", "seed.model"); got != "Role" {
+		t.Fatalf("expected model attr, got %#v", got)
 	}
 }
 
@@ -196,6 +211,7 @@ func TestSyncUpdatesExistingRecord(t *testing.T) {
 	seedTestReset([][]driver.Value{
 		{int64(1), "ADMIN", "Old", time.Now().UTC(), time.Now().UTC()},
 	}[0])
+	provider := &seedTestTracerProvider{}
 	dbConn, err := sql.Open("seed-test", "")
 	if err != nil {
 		t.Fatal(err)
@@ -220,6 +236,10 @@ func TestSyncUpdatesExistingRecord(t *testing.T) {
 				},
 			},
 		},
+		Observability: orm.ObservabilityConfig{
+			Tracing:        true,
+			TracerProvider: provider,
+		},
 	})
 
 	type Role struct {
@@ -230,12 +250,119 @@ func TestSyncUpdatesExistingRecord(t *testing.T) {
 		UpdatedAt time.Time
 	}
 
-	if err := Sync(context.Background(), db, &Role{Code: "ADMIN", Name: "Administrator"}, Key("Code")); err != nil {
+	if err := Sync(context.Background(), db, &Role{ID: 1, Code: "ADMIN", Name: "Administrator"}, Key("Code")); err != nil {
 		t.Fatal(err)
 	}
 	query := strings.ToLower(seedTestLastQuery())
 	if !strings.Contains(query, `update "roles" set`) {
 		t.Fatalf("expected update query, got %q", query)
+	}
+	if got := seedSpanInt64Attr(provider, "seed.sync", "seed.records_updated"); got != 1 {
+		t.Fatalf("expected one updated record, got %#v", got)
+	}
+}
+
+func TestSyncSkipsUnchangedRecord(t *testing.T) {
+	seedTestReset([][]driver.Value{
+		{int64(1), "ADMIN", "Administrator", time.Now().UTC(), time.Now().UTC()},
+	}[0])
+	provider := &seedTestTracerProvider{}
+	dbConn, err := sql.Open("seed-test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbConn.Close()
+
+	db := orm.New(orm.Config{
+		DB:      dbConn,
+		Dialect: postgres.New(),
+		Schema: &schema.Schema{
+			Tables: []*schema.Table{
+				{
+					Name:       "roles",
+					GoTypeName: "Role",
+					Columns: []*schema.Column{
+						{Name: "id", PrimaryKey: true},
+						{Name: "code", Unique: true},
+						{Name: "name"},
+						{Name: "created_at", CreatedAt: true},
+						{Name: "updated_at", UpdatedAt: true},
+					},
+				},
+			},
+		},
+		Observability: orm.ObservabilityConfig{
+			Tracing:        true,
+			TracerProvider: provider,
+		},
+	})
+
+	type Role struct {
+		ID        int
+		Code      string
+		Name      string
+		CreatedAt time.Time
+		UpdatedAt time.Time
+	}
+
+	if err := Sync(context.Background(), db, &Role{ID: 1, Code: "ADMIN", Name: "Administrator"}, Key("Code")); err != nil {
+		t.Fatal(err)
+	}
+	if got := seedSpanInt64Attr(provider, "seed.sync", "seed.records_skipped"); got != 1 {
+		t.Fatalf("expected one skipped record, got %#v spans=%#v", got, provider.spans)
+	}
+}
+
+func TestSyncRecordsErrorOnConflict(t *testing.T) {
+	seedTestReset(
+		[]driver.Value{int64(1), "ADMIN", "Old", time.Now().UTC(), time.Now().UTC()},
+		[]driver.Value{int64(2), "ADMIN", "Older", time.Now().UTC(), time.Now().UTC()},
+	)
+	provider := &seedTestTracerProvider{}
+	dbConn, err := sql.Open("seed-test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbConn.Close()
+
+	db := orm.New(orm.Config{
+		DB:      dbConn,
+		Dialect: postgres.New(),
+		Schema: &schema.Schema{
+			Tables: []*schema.Table{
+				{
+					Name:       "roles",
+					GoTypeName: "Role",
+					Columns: []*schema.Column{
+						{Name: "id", PrimaryKey: true},
+						{Name: "code", Unique: true},
+						{Name: "name"},
+						{Name: "created_at", CreatedAt: true},
+						{Name: "updated_at", UpdatedAt: true},
+					},
+				},
+			},
+		},
+		Observability: orm.ObservabilityConfig{
+			Tracing:        true,
+			TracerProvider: provider,
+		},
+	})
+
+	type Role struct {
+		ID        int
+		Code      string
+		Name      string
+		CreatedAt time.Time
+		UpdatedAt time.Time
+	}
+
+	err = Sync(context.Background(), db, &Role{Code: "ADMIN", Name: "Administrator"}, Key("Code"))
+	if err == nil {
+		t.Fatal("expected conflict error")
+	}
+	if !seedSpanErrored(provider, "seed.sync") {
+		t.Fatalf("expected errored seed span, got %#v", provider.spans)
 	}
 }
 
@@ -288,6 +415,71 @@ func TestRunRejectsCycles(t *testing.T) {
 	}
 }
 
+func TestRunTracesSeedOperation(t *testing.T) {
+	Reset()
+	t.Cleanup(Reset)
+	order := []string{}
+	Register(
+		recordingSeeder{name: "roles", order: &order},
+		recordingSeeder{name: "permissions", deps: []string{"roles"}, order: &order},
+	)
+	provider := &seedTestTracerProvider{}
+	dbConn, err := sql.Open("seed-test", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer dbConn.Close()
+	db := orm.New(orm.Config{
+		DB:      dbConn,
+		Dialect: postgres.New(),
+		Observability: orm.ObservabilityConfig{
+			Tracing:        true,
+			TracerProvider: provider,
+		},
+	})
+	ctx := context.WithValue(context.Background(), seedTestContextKey{}, "trace-seed")
+	if err := Run(ctx, db, WithSingleTransaction()); err != nil {
+		t.Fatal(err)
+	}
+	if !seedHasSpan(provider.spans, "seed.run") {
+		t.Fatalf("expected seed.run span, got %#v", provider.spans)
+	}
+	if got := seedSpanAttr(provider, "seed.run", "seed.operation"); got != "run" {
+		t.Fatalf("expected run operation attr, got %#v", got)
+	}
+	if got := seedSpanInt64Attr(provider, "seed.run", "seed.models_processed"); got != 2 {
+		t.Fatalf("expected two processed models, got %#v", got)
+	}
+	if got := seedSpanContext(provider, "seed.run"); got != "trace-seed" {
+		t.Fatalf("expected context propagation, got %#v", got)
+	}
+}
+
+func TestSeedValuesEqualIgnoresAuditFields(t *testing.T) {
+	type Role struct {
+		ID        int
+		Code      string
+		Name      string
+		CreatedAt time.Time
+		UpdatedAt time.Time
+	}
+	left := Role{
+		ID:        1,
+		Code:      "ADMIN",
+		Name:      "Administrator",
+		CreatedAt: time.Now().UTC(),
+		UpdatedAt: time.Now().UTC(),
+	}
+	right := Role{
+		ID:   1,
+		Code: "ADMIN",
+		Name: "Administrator",
+	}
+	if !seedValuesEqual(reflect.ValueOf(left), reflect.ValueOf(right)) {
+		t.Fatal("expected audit fields to be ignored")
+	}
+}
+
 type recordingSeeder struct {
 	name  string
 	deps  []string
@@ -301,4 +493,130 @@ func (s recordingSeeder) Dependencies() []string { return append([]string(nil), 
 func (s recordingSeeder) Run(_ context.Context, _ *orm.Session) error {
 	*s.order = append(*s.order, s.name)
 	return nil
+}
+
+type seedTestContextKey struct{}
+
+type seedTestTracerProvider struct {
+	mu    sync.Mutex
+	spans []seedTestSpanRecord
+}
+
+type seedTestSpanRecord struct {
+	Name       string
+	Attributes map[string]any
+	Errored    bool
+	Context    string
+}
+
+type seedTestTracer struct {
+	provider *seedTestTracerProvider
+}
+
+type seedTestSpan struct {
+	provider *seedTestTracerProvider
+	index    int
+}
+
+func (p *seedTestTracerProvider) Tracer(string) orm.Tracer {
+	return seedTestTracer{provider: p}
+}
+
+func (t seedTestTracer) Start(ctx context.Context, name string, _ ...orm.SpanOption) (context.Context, orm.Span) {
+	t.provider.mu.Lock()
+	defer t.provider.mu.Unlock()
+	rec := seedTestSpanRecord{Name: name, Attributes: map[string]any{}}
+	if v, ok := ctx.Value(seedTestContextKey{}).(string); ok {
+		rec.Context = v
+	}
+	t.provider.spans = append(t.provider.spans, rec)
+	return ctx, seedTestSpan{provider: t.provider, index: len(t.provider.spans) - 1}
+}
+
+func (s seedTestSpan) End() {}
+
+func (s seedTestSpan) RecordError(err error) {
+	if err == nil {
+		return
+	}
+	s.provider.mu.Lock()
+	if s.index >= 0 && s.index < len(s.provider.spans) {
+		s.provider.spans[s.index].Errored = true
+	}
+	s.provider.mu.Unlock()
+}
+
+func (s seedTestSpan) SetAttributes(attrs ...orm.Attribute) {
+	s.provider.mu.Lock()
+	defer s.provider.mu.Unlock()
+	if s.index < 0 || s.index >= len(s.provider.spans) {
+		return
+	}
+	rec := s.provider.spans[s.index]
+	if rec.Attributes == nil {
+		rec.Attributes = map[string]any{}
+	}
+	for _, attr := range attrs {
+		rec.Attributes[attr.Key] = attr.Value
+	}
+	s.provider.spans[s.index] = rec
+}
+
+func seedHasSpan(spans []seedTestSpanRecord, name string) bool {
+	for _, span := range spans {
+		if span.Name == name {
+			return true
+		}
+	}
+	return false
+}
+
+func seedSpanAttr(provider *seedTestTracerProvider, spanName, key string) any {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	for _, span := range provider.spans {
+		if span.Name != spanName {
+			continue
+		}
+		return span.Attributes[key]
+	}
+	return nil
+}
+
+func seedSpanInt64Attr(provider *seedTestTracerProvider, spanName, key string) int64 {
+	v := seedSpanAttr(provider, spanName, key)
+	switch n := v.(type) {
+	case int:
+		return int64(n)
+	case int64:
+		return n
+	case int32:
+		return int64(n)
+	case float64:
+		return int64(n)
+	default:
+		return 0
+	}
+}
+
+func seedSpanErrored(provider *seedTestTracerProvider, spanName string) bool {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	for _, span := range provider.spans {
+		if span.Name == spanName {
+			return span.Errored
+		}
+	}
+	return false
+}
+
+func seedSpanContext(provider *seedTestTracerProvider, spanName string) string {
+	provider.mu.Lock()
+	defer provider.mu.Unlock()
+	for _, span := range provider.spans {
+		if span.Name == spanName {
+			return span.Context
+		}
+	}
+	return ""
 }

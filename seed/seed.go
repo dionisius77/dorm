@@ -141,24 +141,35 @@ func Run(ctx context.Context, db *dorm.DB, opts ...RunOption) error {
 	if err != nil {
 		return err
 	}
-	if cfg.singleTransaction {
-		return db.Tx(ctx, func(tx *orm.Session) error {
-			for _, seeder := range ordered {
-				if err := seeder.Run(ctx, tx); err != nil {
-					return wrapSeederError(seeder.Name(), err)
+	attrs := []orm.Attribute{
+		{Key: "seed.operation", Value: "run"},
+		{Key: "seed.models_processed", Value: len(ordered)},
+		{Key: "seed.single_transaction", Value: cfg.singleTransaction},
+	}
+	return traceSeedOperation(ctx, db, "seed.run", attrs, func(ctx context.Context, span orm.Span) error {
+		if cfg.singleTransaction {
+			if err := db.Tx(ctx, func(tx *orm.Session) error {
+				for _, seeder := range ordered {
+					if err := seeder.Run(ctx, tx); err != nil {
+						return wrapSeederError(seeder.Name(), err)
+					}
 				}
+				return nil
+			}); err != nil {
+				return err
 			}
 			return nil
-		})
-	}
-	for _, seeder := range ordered {
-		if err := db.Tx(ctx, func(tx *orm.Session) error {
-			return seeder.Run(ctx, tx)
-		}); err != nil {
-			return wrapSeederError(seeder.Name(), err)
 		}
-	}
-	return nil
+		for _, seeder := range ordered {
+			if err := db.Tx(ctx, func(tx *orm.Session) error {
+				return seeder.Run(ctx, tx)
+			}); err != nil {
+				return wrapSeederError(seeder.Name(), err)
+			}
+		}
+		_ = span
+		return nil
+	})
 }
 
 // Sync reconciles one record or a collection of records against the database.
@@ -181,12 +192,41 @@ func Sync(ctx context.Context, db SessionProvider, value any, opts ...SyncOption
 		return nil
 	}
 	session := db.WithContext(ctx).WithPolicy(access.IgnoreRLS())
-	for _, item := range values {
-		if err := syncOne(ctx, session, item, cfg.keys); err != nil {
-			return err
-		}
+	modelName := values[0].Type().Name()
+	attrs := []orm.Attribute{
+		{Key: "seed.operation", Value: "sync"},
+		{Key: "seed.model", Value: modelName},
+		{Key: "seed.models_processed", Value: len(values)},
 	}
-	return nil
+	var inserted, updated, skipped int
+	run := func(ctx context.Context, span orm.Span) error {
+		for _, item := range values {
+			action, err := syncOne(ctx, session, item, cfg.keys)
+			if err != nil {
+				return err
+			}
+			switch action {
+			case "inserted":
+				inserted++
+			case "updated":
+				updated++
+			default:
+				skipped++
+			}
+		}
+		if span != nil {
+			span.SetAttributes(
+				orm.Attribute{Key: "seed.records_inserted", Value: inserted},
+				orm.Attribute{Key: "seed.records_updated", Value: updated},
+				orm.Attribute{Key: "seed.records_skipped", Value: skipped},
+			)
+		}
+		return nil
+	}
+	if provider, ok := any(db).(seedTraceProvider); ok {
+		return traceSeedOperation(ctx, provider, "seed.sync", attrs, run)
+	}
+	return run(ctx, nil)
 }
 
 func resolveSeederOrder() ([]Seeder, error) {
@@ -290,32 +330,38 @@ func expandSeedValues(value any) ([]reflect.Value, error) {
 	}
 }
 
-func syncOne(ctx context.Context, session *orm.Session, item reflect.Value, keys []string) error {
+func syncOne(ctx context.Context, session *orm.Session, item reflect.Value, keys []string) (string, error) {
 	if session == nil {
-		return errkind.New(errkind.KindConfiguration, "seed: nil session")
+		return "", errkind.New(errkind.KindConfiguration, "seed: nil session")
 	}
 	record := reflect.New(item.Type()).Elem()
 	record.Set(item)
 	whereOpts, err := buildSeedFilters(record, keys)
 	if err != nil {
-		return err
+		return "", err
 	}
 	existing, err := fetchExisting(session, record.Type(), whereOpts)
 	if err != nil {
-		return err
+		return "", err
 	}
 	switch existing.Len() {
 	case 0:
-		return session.Create(record.Addr().Interface())
+		if err := session.Create(record.Addr().Interface()); err != nil {
+			return "", err
+		}
+		return "inserted", nil
 	case 1:
 		current := existing.Index(0)
 		if seedValuesEqual(current, record) {
-			return nil
+			return "skipped", nil
 		}
 		mergeSeedAuditFields(record, current)
-		return session.UpdateWhere(record.Addr().Interface(), whereOpts...)
+		if err := session.UpdateWhere(record.Addr().Interface(), whereOpts...); err != nil {
+			return "", err
+		}
+		return "updated", nil
 	default:
-		return dormerrors.NewSeedError(dormerrors.KindSeedConflict, record.Type().Name(), strings.Join(keys, ","), map[string]any{"rows": existing.Len()}, nil)
+		return "", dormerrors.NewSeedError(dormerrors.KindSeedConflict, record.Type().Name(), strings.Join(keys, ","), map[string]any{"rows": existing.Len()}, nil)
 	}
 }
 

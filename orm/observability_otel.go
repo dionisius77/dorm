@@ -32,6 +32,7 @@ func (db *DB) traceWithSpan(ctx context.Context, spanName string, attrs []Attrib
 		ensureSpanAttrs(span, attrs)
 		err := fn(ctx, span)
 		setSpanError(span, err)
+		setSpanStatus(span, err)
 		if err != nil && db.observability.Logger != nil {
 			db.observability.Logger.LogError(ctx, err)
 		}
@@ -57,18 +58,20 @@ func baseSpanAttributes(db *DB) []Attribute {
 		return nil
 	}
 	attrs := []Attribute{}
-	system := db.systemName()
-	if system != "" {
+	if system := db.systemName(); system != "" {
 		attrs = append(attrs, Attribute{Key: "db.system", Value: system})
 	}
 	if db.driverName != "" {
-		attrs = append(attrs, Attribute{Key: "orm.driver", Value: db.driverName})
+		attrs = append(attrs, Attribute{Key: "driver.name", Value: db.driverName})
 	}
 	if db.dialect != nil {
-		attrs = append(attrs, Attribute{Key: "orm.dialect", Value: db.dialect.Name()})
+		attrs = append(attrs, Attribute{Key: "driver.dialect", Value: db.dialect.Name()})
 	}
 	if db.executionMode != executionModeNormal {
 		attrs = append(attrs, Attribute{Key: "orm.execution_mode", Value: string(db.executionMode)})
+	}
+	if db.schema != nil && db.schema.Name != "" {
+		attrs = append(attrs, Attribute{Key: "db.name", Value: db.schema.Name})
 	}
 	return attrs
 }
@@ -77,11 +80,11 @@ func (db *DB) systemName() string {
 	if db == nil {
 		return ""
 	}
-	if db.driverName != "" {
-		return db.driverName
-	}
 	if db.dialect != nil {
 		return db.dialect.Name()
+	}
+	if db.driverName != "" {
+		return db.driverName
 	}
 	return ""
 }
@@ -200,6 +203,17 @@ func setSpanError(span Span, err error) {
 		return
 	}
 	span.RecordError(err)
+}
+
+func setSpanStatus(span Span, err error) {
+	if span == nil || err == nil {
+		return
+	}
+	if statusSetter, ok := span.(interface {
+		SetStatus(otelcodes.Code, string)
+	}); ok {
+		statusSetter.SetStatus(otelcodes.Error, err.Error())
+	}
 }
 
 func ensureSpanAttrs(span Span, attrs []Attribute) {

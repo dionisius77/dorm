@@ -155,6 +155,30 @@ func (s *Session) WithPolicy(policy access.Policy) *Session {
 	return &cp
 }
 
+// Observability returns the underlying database observability configuration.
+func (s *Session) Observability() ObservabilityConfig {
+	if s == nil || s.db == nil {
+		return ObservabilityConfig{}
+	}
+	return s.db.Observability()
+}
+
+// DriverName returns the configured driver name.
+func (s *Session) DriverName() string {
+	if s == nil || s.db == nil {
+		return ""
+	}
+	return s.db.DriverName()
+}
+
+// Dialect returns the configured SQL dialect.
+func (s *Session) Dialect() dialect.Dialect {
+	if s == nil || s.db == nil {
+		return nil
+	}
+	return s.db.Dialect()
+}
+
 func (s *Session) DryRun() *DryRunSession {
 	if s == nil {
 		return &DryRunSession{}
@@ -167,7 +191,7 @@ func (s *Session) Find(dest any, opts ...QueryOption) error {
 	if err != nil {
 		return err
 	}
-	return s.db.traceOperation(s.ctx, "db.query", state.traceAttrs("find"), func(ctx context.Context) error {
+	return s.db.traceOperation(s.ctx, "db.query", state.traceAttrs(s.ctx, "find"), func(ctx context.Context) error {
 		if err := invokeBeforeFindHook(ctx, s.db, beforeFindHookModel(dest)); err != nil {
 			return err
 		}
@@ -206,7 +230,7 @@ func (s *Session) Count(model any, opts ...QueryOption) (int64, error) {
 	if err != nil {
 		return 0, err
 	}
-	err = s.db.traceOperation(s.ctx, "db.query", state.traceAttrs("count"), func(ctx context.Context) error {
+	err = s.db.traceOperation(s.ctx, "db.query", state.traceAttrs(s.ctx, "count"), func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
 		sqlText, args, err := s.db.buildSelectSQL(ctx, state)
 		if err != nil {
@@ -239,7 +263,7 @@ func (s *Session) Exists(model any, opts ...QueryOption) (bool, error) {
 		return false, err
 	}
 	var exists bool
-	err = s.db.traceOperation(s.ctx, "db.query", state.traceAttrs("exists"), func(ctx context.Context) error {
+	err = s.db.traceOperation(s.ctx, "db.query", state.traceAttrs(s.ctx, "exists"), func(ctx context.Context) error {
 		s.db.logPolicyOverride(ctx)
 		sqlText, args, err := s.db.buildSelectSQL(ctx, state)
 		if err != nil {
@@ -500,6 +524,22 @@ func (db *DB) SQLDB() *sql.DB {
 		return nil
 	}
 	return db.db
+}
+
+// Observability returns the current observability configuration.
+func (db *DB) Observability() ObservabilityConfig {
+	if db == nil {
+		return ObservabilityConfig{}
+	}
+	return db.observability
+}
+
+// DriverName returns the configured driver name.
+func (db *DB) DriverName() string {
+	if db == nil {
+		return ""
+	}
+	return db.driverName
 }
 
 func (db *DB) Dialect() dialect.Dialect {
@@ -870,11 +910,16 @@ func (s *Session) countState(model any, opts ...QueryOption) (*queryState, error
 	return state, nil
 }
 
-func (s *queryState) traceAttrs(operation string) []Attribute {
+func (s *queryState) traceAttrs(ctx context.Context, operation string) []Attribute {
 	if s == nil {
 		return []Attribute{{Key: "orm.operation", Value: operation}}
 	}
-	attrs := []Attribute{{Key: "orm.operation", Value: operation}}
+	attrs := []Attribute{
+		{Key: "orm.operation", Value: operation},
+		{Key: "db.operation", Value: operation},
+		{Key: "orm.table", Value: s.table.Name},
+		{Key: "orm.model", Value: s.table.GoTypeName},
+	}
 	attrs = append(attrs,
 		Attribute{Key: "orm.query.option_count", Value: s.optionCount()},
 		Attribute{Key: "orm.query.join_count", Value: len(s.joins)},
@@ -885,6 +930,14 @@ func (s *queryState) traceAttrs(operation string) []Attribute {
 	)
 	if len(s.selectColumns) > 0 {
 		attrs = append(attrs, Attribute{Key: "orm.query.select_count", Value: len(s.selectColumns)})
+	}
+	if ac, ok := access.FromContext(ctx); ok {
+		if ac.CompanyID != nil {
+			attrs = append(attrs, Attribute{Key: "access.company", Value: ac.CompanyID})
+		}
+		if policy := ac.Policy.Normalize(); policy.Name() != "" {
+			attrs = append(attrs, Attribute{Key: "access.policy", Value: policy.Name()})
+		}
 	}
 	return attrs
 }
